@@ -1,0 +1,5 @@
+streamlit>=1.36
+pymupdf>=1.24
+pikepdf>=9.0
+pillow>=10.0
+pandas>=2.0
