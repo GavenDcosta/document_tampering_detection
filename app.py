@@ -41,7 +41,7 @@ st.markdown("""
   .ev {font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.78rem;
        color:#4b5563; background:#f2f3f5; padding:.15rem .4rem; border-radius:4px;
        display:inline-block; margin-top:.35rem;}
-  .meta {font-family:ui-monospace,monospace; font-size:.8rem; color:#374151;}
+  .meta {font-family:ui-monospace,monospace; font-size:.8rem; opacity:.7;}
 </style>
 """, unsafe_allow_html=True)
 
