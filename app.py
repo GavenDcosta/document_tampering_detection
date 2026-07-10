@@ -893,16 +893,34 @@ for fn, r in results.items():
 # ---- manual verification checklist ----
 st.subheader("Manual verification checklist")
 st.caption("What the tool cannot confirm offline. Work through these to close the case.")
-verify_findings = [f for r in results.values() for f in r["findings"] if f["status"] == "VERIFY"]
-verify_findings += [f for f in cross if f["status"] == "VERIFY"]
-for f in verify_findings:
+verify_findings = [(fn, f) for fn, r in results.items()
+                   for f in r["findings"] if f["status"] == "VERIFY"]
+verify_findings += [("(across files)", f) for f in cross if f["status"] == "VERIFY"]
+for i, (fn, f) in enumerate(verify_findings):
     h = fe.humanize(f)
-    st.checkbox(f"{h['headline']} — {h['action']}", key=f"vf_{id(f)}")
+    # Stable key: file + title + page (not id(f), which changes every rerun and
+    # would reset the checkbox state).
+    key = f"vf_{fn}|{f['title']}|{f.get('page')}|{i}"
+    st.checkbox(f"{h['headline']} — {h['action']}", key=key)
 for title, desc in fe.MANUAL_CHECKLIST:
     st.checkbox(f"{title} — {desc}", key=f"mc_{title}")
 
 # ---- downloads ----
 st.subheader("Export report")
+
+
+def report_basename(results):
+    """Tampering_Report_<file name>, derived from the uploaded file(s)."""
+    import re
+    names = list(results.keys())
+    stem = os.path.splitext(names[0])[0]
+    if len(names) > 1:
+        stem = f"{stem}_plus_{len(names) - 1}_more"
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", stem).strip("_") or "document"
+    return f"Tampering_Report_{safe}"
+
+
+base = report_basename(results)
 d1, d2, d3 = st.columns(3)
 md = build_markdown(results, cross)
 json_blob = json.dumps(
@@ -910,9 +928,9 @@ json_blob = json.dumps(
     | {"_cross_document": cross}, indent=2, default=str)
 pdf_bytes = build_pdf_report(results, cross, paths=paths)
 
-d1.download_button("Download PDF report", pdf_bytes, file_name="forensics_report.pdf",
+d1.download_button("Download PDF report", pdf_bytes, file_name=f"{base}.pdf",
                    mime="application/pdf", use_container_width=True)
-d2.download_button("Download Markdown", md, file_name="forensics_report.md",
+d2.download_button("Download Markdown", md, file_name=f"{base}.md",
                    mime="text/markdown", use_container_width=True)
-d3.download_button("Download JSON", json_blob, file_name="forensics_report.json",
+d3.download_button("Download JSON", json_blob, file_name=f"{base}.json",
                    mime="application/json", use_container_width=True)
