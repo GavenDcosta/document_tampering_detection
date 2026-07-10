@@ -162,6 +162,67 @@ def _ela(pil_img, quality=90, grid=8):
     return png.getvalue(), ratio, max_block
 
 
+def _copy_move(pil_img, min_cluster=50):
+    """Copy-move forgery detection (roadmap #8): find a region duplicated elsewhere in
+    the SAME image by matching ORB keypoints against themselves and looking for many
+    matches that share the same translation offset (a pasted block moves as one).
+    The threshold sits well above the baseline that ordinary repeated text/layout
+    produces (~20) but below a real cloned block (hundreds). Returns match count or 0."""
+    import cv2
+    import numpy as np
+    arr = np.asarray(pil_img.convert("L"))
+    if arr.shape[0] < 80 or arr.shape[1] < 80:
+        return 0
+    orb = cv2.ORB_create(nfeatures=5000)
+    kp, des = orb.detectAndCompute(arr, None)
+    if des is None or len(kp) < 20:
+        return 0
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+    knn = bf.knnMatch(des, des, k=4)
+    offsets = defaultdict(int)
+    for group in knn:
+        for cand in group:
+            if cand.queryIdx == cand.trainIdx or cand.distance > 30:
+                continue
+            p1 = kp[cand.queryIdx].pt
+            p2 = kp[cand.trainIdx].pt
+            dx, dy = p1[0] - p2[0], p1[1] - p2[1]
+            if (dx * dx + dy * dy) ** 0.5 < 40:      # too close = same feature
+                continue
+            offsets[(round(dx / 8), round(dy / 8))] += 1   # quantise the offset
+    if not offsets:
+        return 0
+    best = max(offsets.values()) // 2      # each pair counted from both ends
+    return best if best >= min_cluster else 0
+
+
+def _noise_map(pil_img, grid=8):
+    """Estimate local sensor/compression noise across the image. A region pasted from
+    another source usually has a different noise profile than its surroundings.
+    Returns (heatmap_png_bytes, outlier_ratio). numpy-based (roadmap #10)."""
+    import numpy as np
+    from PIL import ImageFilter
+    g = pil_img.convert("L")
+    hp = np.asarray(g, dtype=np.float32) - np.asarray(
+        g.filter(ImageFilter.GaussianBlur(2)), dtype=np.float32)  # high-pass = noise
+    h, w = hp.shape
+    bh, bw = max(h // grid, 1), max(w // grid, 1)
+    blocks = np.zeros((grid, grid), dtype=np.float32)
+    for i in range(grid):
+        for j in range(grid):
+            blk = hp[i * bh:(i + 1) * bh, j * bw:(j + 1) * bw]
+            blocks[i, j] = float(blk.std()) if blk.size else 0.0
+    med = float(np.median(blocks)) or 1e-3
+    mx = float(blocks.max())
+    ratio = mx / med
+    # heatmap: normalise block std, upscale to a small image
+    norm = (blocks - blocks.min()) / (blocks.ptp() or 1) * 255.0
+    heat = Image.fromarray(norm.astype("uint8")).resize((256, 256), Image.NEAREST)
+    buf = io.BytesIO()
+    heat.convert("L").save(buf, "PNG")
+    return buf.getvalue(), ratio
+
+
 def _exif_summary(img):
     """Pull the forensically interesting EXIF tags out of a PIL image, if any."""
     try:
@@ -257,6 +318,88 @@ def layer_structure(path):
         "trailer_prev": len(re.findall(rb"trailer[\s\S]{0,400}?/Prev", data)),
         "has_sig": bool(re.search(rb"/Type\s*/Sig|/SubFilter\s*/adbe", data)),
     }
+
+
+def layer_signatures(path):
+    """Validate embedded cryptographic (PKI) signatures with pyhanko (roadmap #9):
+    is the signed content intact, does the signature cover the WHOLE file, and who
+    signed. Trust-chain validation needs online roots, so we report what can be
+    established offline and say so. Returns a list of findings."""
+    findings = []
+    try:
+        from pyhanko.pdf_utils.reader import PdfFileReader
+        from pyhanko.sign.validation import validate_pdf_signature
+        from pyhanko_certvalidator import ValidationContext
+    except Exception:
+        return findings
+    try:
+        with open(path, "rb") as fh:
+            reader = PdfFileReader(fh)
+            embedded = list(reader.embedded_signatures)
+            if not embedded:
+                return findings
+            vc = ValidationContext(allow_fetching=False)
+            for i, sig in enumerate(embedded):
+                intact = covers = signer = None
+                try:
+                    status = validate_pdf_signature(sig, vc)
+                    intact = getattr(status, "intact", None)
+                    cov = getattr(status, "coverage", None)
+                    covers = "ENTIRE_FILE" in str(cov).upper() if cov is not None else None
+                    cert = getattr(status, "signing_cert", None)
+                    if cert is not None:
+                        signer = cert.subject.human_friendly
+                except Exception:
+                    pass
+                if intact is False:
+                    findings.append(_finding(
+                        "Signature", "High", "CONFIRMED",
+                        "Digital signature is broken (content changed after signing)",
+                        f"Signature {i+1} does not match the content it covers — the signed "
+                        f"bytes were altered after signing. This is a definitive sign the "
+                        f"document was changed after it was signed. Signer as stated: "
+                        f"{signer or 'unknown'}.",
+                        evidence=f"pyhanko: intact=False signer={signer}"))
+                elif covers is False:
+                    findings.append(_finding(
+                        "Signature", "High", "REVIEW",
+                        "Signature covers only part of the file",
+                        f"Signature {i+1} is intact but does NOT cover the whole file — content "
+                        f"was added after this revision was signed (the classic 'sign then "
+                        f"append' attack). Signer: {signer or 'unknown'}.",
+                        evidence=f"pyhanko: intact=True covers_whole_file=False signer={signer}"))
+                else:
+                    findings.append(_finding(
+                        "Signature", "Info", "VERIFY",
+                        "Digital signature present and internally intact",
+                        f"Signature {i+1} is cryptographically intact and (as far as can be "
+                        f"checked offline) covers the file. Signer as stated: "
+                        f"{signer or 'unknown'}. Whether that signer is TRUSTED still needs an "
+                        f"online certificate/revocation check against trusted roots.",
+                        evidence=f"pyhanko: intact={intact} covers_whole={covers} signer={signer}"))
+    except Exception:
+        pass
+    return findings
+
+
+def layer_revisions(path):
+    """Reconstruct each saved generation of an incrementally-updated PDF by truncating
+    the file at each %%EOF and reopening it, then return the extracted text per
+    revision (oldest first). Lets us DIFF revisions to show what actually changed."""
+    data = open(path, "rb").read()
+    ends = [m.end() for m in re.finditer(rb"%%EOF", data)]
+    if len(ends) < 2:
+        return []
+    texts = []
+    for end in ends:
+        prefix = data[:end]
+        try:
+            d = fitz.open(stream=prefix, filetype="pdf")
+            texts.append("\n".join(p.get_text("text") for p in d))
+            d.close()
+        except Exception:
+            texts.append(None)
+    return [t for t in texts if t is not None]
 
 
 def layer_metadata(path):
@@ -391,6 +534,61 @@ def layer_drawings(doc, section_map):
     return findings
 
 
+def _font_source_id(buf):
+    """A 'source fingerprint' for an embedded font, based on the actual font DESIGN
+    (units-per-em + design revision + the outline table format). Two same-named fonts
+    with different fingerprints are genuinely different font programs (different
+    version/foundry) — a real splice. Subsetting the SAME font does NOT change these,
+    so it won't false-positive on ordinary re-embedding."""
+    from fontTools.ttLib import TTFont
+    ft = TTFont(io.BytesIO(buf), fontNumber=0, lazy=True)
+    upm = ft["head"].unitsPerEm if "head" in ft else 0
+    rev = round(float(ft["head"].fontRevision), 3) if "head" in ft else 0
+    outline = "cff" if "CFF " in ft else ("glyf" if "glyf" in ft else "?")
+    return (upm, rev, outline)
+
+
+def layer_font_glyphs(doc):
+    """Compare embedded fonts that share a name: identical name + different source
+    fingerprint = a splice (roadmap #3). Uses fonttools on the embedded font program."""
+    findings = []
+    # collect pages per font xref, and the font's display name
+    xref_pages = defaultdict(set)
+    xref_name = {}
+    for pno in range(doc.page_count):
+        for f in doc[pno].get_fonts(full=True):
+            xref = f[0]
+            xref_pages[xref].add(pno + 1)
+            xref_name[xref] = re.sub(r"^[A-Z]{6}\+", "", f[3] or "")
+    by_name = defaultdict(dict)   # name -> {source_fingerprint: set(pages)}
+    for xref, pages in xref_pages.items():
+        try:
+            _n, ext, _t, buf = doc.extract_font(xref)
+        except Exception:
+            continue
+        if not buf or ext not in ("ttf", "otf", "cff", "woff"):
+            continue
+        try:
+            sid = _font_source_id(buf)
+        except Exception:
+            continue
+        by_name[xref_name[xref]].setdefault(sid, set()).update(pages)
+    for name, sources in by_name.items():
+        if len(sources) >= 2:
+            descs = "; ".join(f"source {i+1} on pages {sorted(p)[:6]}"
+                              for i, (s, p) in enumerate(sources.items()))
+            findings.append(_finding(
+                "Fonts", "Medium", "REVIEW", "Same font name but two different font sources",
+                f"The font '{name}' appears in this document built from {len(sources)} different "
+                f"sources (different foundry/version fingerprints), even though the name is "
+                f"identical. Passing off the same font name is how an inserted clause is hidden "
+                f"— genuine single-source text uses one identical font program throughout. "
+                f"{descs}.",
+                page=min(min(p) for p in sources.values()),
+                evidence=f"'{name}': {len(sources)} distinct font fingerprints"))
+    return findings
+
+
 def layer_watermarks(doc, text):
     """Detect large, faint, repeated text (a watermark) and flag it if it appears on
     only SOME pages — an inconsistent watermark can mean pages were swapped in/out."""
@@ -480,6 +678,29 @@ def analyze_document(path, filename=None):
             f"the revisions to see what changed.",
             evidence=f"eof={struct['eof']} startxref={struct['startxref']} "
                      f"trailer/Prev={struct['trailer_prev']}"))
+        # Reconstruct the revisions and show WHAT changed between them (#5)
+        try:
+            revs = layer_revisions(path)
+            for i in range(1, len(revs)):
+                old = revs[i - 1].split("\n")
+                new = revs[i].split("\n")
+                added = [l.strip() for l in new if l.strip() and l not in old][:6]
+                removed = [l.strip() for l in old if l.strip() and l not in new][:6]
+                if not added and not removed:
+                    continue
+                bits = []
+                if removed:
+                    bits.append("removed: " + " | ".join(removed[:4]))
+                if added:
+                    bits.append("added: " + " | ".join(added[:4]))
+                findings.append(_finding(
+                    "Structure", "High", "CONFIRMED", "Content changed between saved revisions",
+                    f"Comparing revision {i} with revision {i+1} of this file shows text that "
+                    f"was changed after an earlier save. {'; '.join(bits)}. Edits made after "
+                    f"a document was 'finalised' or signed are the classic tampering pattern.",
+                    evidence="; ".join(bits)[:200]))
+        except Exception:
+            pass
     if ident["trailing_after_eof"] and ident["trailing_after_eof"] > 4:
         findings.append(_finding(
             "File", "Medium", "REVIEW", "Data after end-of-file marker",
@@ -487,12 +708,16 @@ def analyze_document(path, filename=None):
             f"appended payload or a second document stitched on — inspect the tail bytes.",
             evidence=f"{ident['trailing_after_eof']} trailing bytes"))
     if struct["has_sig"]:
-        findings.append(_finding(
-            "Signature", "Info", "VERIFY", "Digital signature object present",
-            "A /Sig object exists. Validate the certificate chain and confirm the "
-            "signature covers the whole file (not just an earlier revision) with a PKI "
-            "validator — that can't be confirmed offline here.",
-            evidence="/Sig present"))
+        sig_findings = layer_signatures(path)   # actually validate with pyhanko (#9)
+        if sig_findings:
+            findings.extend(sig_findings)
+        else:
+            findings.append(_finding(
+                "Signature", "Info", "VERIFY", "Digital signature object present",
+                "A /Sig object exists. Validate the certificate chain and confirm the "
+                "signature covers the whole file (not just an earlier revision) with a PKI "
+                "validator — that can't be confirmed offline here.",
+                evidence="/Sig present"))
 
     # ---- METADATA ----
     info = meta["info"]
@@ -674,7 +899,40 @@ def analyze_document(path, filename=None):
                 # on rasters like this, not on born-digital text).
                 try:
                     raw = doc.extract_image(im["xref"])
-                    heat, ratio, mx = _ela(Image.open(io.BytesIO(raw["image"])))
+                    _pim = Image.open(io.BytesIO(raw["image"]))
+                    # Copy-move forgery within the page (#8)
+                    try:
+                        cm = _copy_move(_pim)
+                        if cm:
+                            findings.append(_finding(
+                                "Image", "Medium", "REVIEW",
+                                "Duplicated region within a scanned page (copy-move)",
+                                f"Part of scanned page {im['page']} appears to have been "
+                                f"copied and pasted elsewhere on the same page ({cm} matching "
+                                f"feature points move together as a block). This is how a "
+                                f"value or a stamp is cloned to cover or fake another. Note "
+                                f"that pages with heavily repeated layout can also trigger "
+                                f"this, so confirm visually.",
+                                page=im["page"], evidence=f"{cm} consistent copy-move matches"))
+                    except Exception:
+                        pass
+                    # Noise-inconsistency analysis (#10)
+                    try:
+                        nheat, nratio = _noise_map(_pim)
+                        if nratio >= 6.0:
+                            findings.append(_finding(
+                                "Image", "Medium", "REVIEW",
+                                "Uneven noise across a scanned page",
+                                f"The noise pattern on scanned page {im['page']} is uneven — "
+                                f"one area is much noisier (or much smoother) than the rest. "
+                                f"A region pasted in from another source typically carries a "
+                                f"different noise signature, so an outlier can mark an inserted "
+                                f"patch. Inspect the bright area on the heatmap.",
+                                page=im["page"], evidence=f"noise outlier ratio {nratio:.1f}",
+                                image_png=nheat))
+                    except Exception:
+                        pass
+                    heat, ratio, mx = _ela(_pim)
                     if ratio >= 4.0 and mx >= 25:
                         findings.append(_finding(
                             "Image", "Medium", "REVIEW",
@@ -783,6 +1041,12 @@ def analyze_document(path, filename=None):
             page=min(min(c["pages"]) for c in logo_clusters),
             evidence="; ".join(parts), image_refs=refs))
 
+    # ---- font glyph-level splice check ----
+    try:
+        findings.extend(layer_font_glyphs(doc))
+    except Exception:
+        pass
+
     # ---- watermark consistency ----
     findings.extend(layer_watermarks(doc, text))
 
@@ -800,6 +1064,146 @@ def analyze_document(path, filename=None):
     }
     return {"summary": summary, "findings": findings, "_images": imgs,
             "_created_dt": cdate, "_producer": producer, "_author": author}
+
+
+# ---------------------------------------------------------------------------
+# Office formats (.docx / .xlsx / .pptx) — roadmap #13
+# OOXML files are ZIPs of XML; they carry richer forensic metadata than PDFs
+# (author vs last-editor, revision count, editing time, tracked changes).
+# ---------------------------------------------------------------------------
+def _ooxml_props(path):
+    import zipfile, xml.etree.ElementTree as ET
+    props, names = {}, set()
+    with zipfile.ZipFile(path) as z:
+        names = set(z.namelist())
+        for member in ("docProps/core.xml", "docProps/app.xml"):
+            if member not in names:
+                continue
+            try:
+                root = ET.fromstring(z.read(member))
+            except Exception:
+                continue
+            for el in root.iter():
+                tag = el.tag.split("}")[-1]
+                if el.text and el.text.strip():
+                    props[tag] = el.text.strip()
+        blobs = {}
+        for member in ("word/document.xml", "xl/sharedStrings.xml", "ppt/presentation.xml"):
+            if member in names:
+                try:
+                    blobs[member] = z.read(member).decode("utf-8", "ignore")
+                except Exception:
+                    pass
+    return props, names, blobs
+
+
+def _iso(s):
+    if not s:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def analyze_office(path, filename=None):
+    filename = filename or os.path.basename(path)
+    data = open(path, "rb").read()
+    props, names, blobs = _ooxml_props(path)
+    findings = []
+
+    creator = props.get("creator", "")
+    last_by = props.get("lastModifiedBy", "")
+    company = props.get("Company", "")
+    template = props.get("Template", "")
+    application = props.get("Application", "")
+    revision = props.get("revision", "")
+    total_time = props.get("TotalTime", "")
+    created = _iso(props.get("created"))
+    modified = _iso(props.get("modified"))
+    title = props.get("title", "")
+
+    # different last editor than the author
+    if creator and last_by and creator.strip().lower() != last_by.strip().lower():
+        findings.append(_finding(
+            "Metadata", "Medium", "REVIEW", "Last editor differs from the author",
+            f"The document was created by '{creator}' but last saved by '{last_by}'. More than "
+            f"one person handled the file — normal for collaboration, relevant if the parties "
+            f"are meant to be independent.",
+            evidence=f"creator={creator}; lastModifiedBy={last_by}"))
+
+    # modified before created
+    if created and modified and modified < created:
+        findings.append(_finding(
+            "Metadata", "Medium", "REVIEW", "Modified before created",
+            f"The file says it was last modified ({modified}) before it was created ({created}) "
+            f"— impossible for an untouched file, so a timestamp was changed.",
+            evidence=f"created={created}; modified={modified}"))
+
+    # template names a foreign brand
+    if template and template.lower() not in ("normal.dotm", "normal", ""):
+        foreign = _foreign_brand_in_title(template, filename)
+        if foreign:
+            findings.append(_finding(
+                "Metadata", "High", "VERIFY", "Internal name reveals a different company",
+                f"The document is built on a template named '{template}', which carries the "
+                f"name '{foreign}' — a company/brand that isn't this document's own. A template "
+                f"from another party is a classic rebrand fingerprint.",
+                evidence=f"Template={template}"))
+
+    # company field
+    if company and _foreign_brand_in_title(company, filename):
+        findings.append(_finding(
+            "Metadata", "Medium", "REVIEW", "Embedded company name",
+            f"The file's Company property is '{company}'. Confirm it matches the party this "
+            f"document is meant to be from.",
+            evidence=f"Company={company}"))
+
+    # high revision count / editing time
+    try:
+        if revision and int(revision) >= 20:
+            findings.append(_finding(
+                "Metadata", "Info", "REVIEW", "Many save cycles",
+                f"The document has been saved {revision} times (revision counter). Not a "
+                f"problem by itself, but useful context for how much it was worked on.",
+                evidence=f"revision={revision}"))
+    except Exception:
+        pass
+
+    # tracked changes still in a Word doc
+    docxml = blobs.get("word/document.xml", "")
+    ins, dele = docxml.count("<w:ins "), docxml.count("<w:del ")
+    if ins or dele:
+        findings.append(_finding(
+            "Text", "High", "REVIEW", "Unaccepted tracked changes in the document",
+            f"The Word file still contains tracked changes ({ins} insertions, {dele} deletions) "
+            f"that were never accepted or rejected. The 'final' text you see may differ from "
+            f"what prints, and the change history reveals what was edited.",
+            evidence=f"w:ins={ins} w:del={dele}"))
+
+    cdate = created
+    summary = {
+        "file": filename,
+        "pages": props.get("Pages") or props.get("Slides") or props.get("Sheets") or "-",
+        "producer": application or "-",
+        "creator": creator, "author": creator, "title": title or template,
+        "created": str(created) if created else "",
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "size": len(data),
+        "analyzed_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "last_modified_by": last_by, "revision": revision,
+        "editing_minutes": total_time,
+    }
+    return {"summary": summary, "findings": findings, "_images": [],
+            "_created_dt": cdate, "_producer": application, "_author": creator}
+
+
+def analyze_file(path, filename=None):
+    """Dispatch to the right analyser by file type (PDF vs Office)."""
+    ext = os.path.splitext(filename or path)[1].lower()
+    if ext in (".docx", ".xlsx", ".pptx", ".docm", ".xlsm", ".pptm"):
+        return analyze_office(path, filename)
+    return analyze_document(path, filename)
 
 
 # ---------------------------------------------------------------------------
@@ -933,11 +1337,38 @@ PLAIN_LANGUAGE = {
         "is still hidden in the file.",
         "Have a specialist reconstruct the earlier version and compare it with the current "
         "one to see exactly what changed (for example a date or an amount)."),
+    "Content changed between saved revisions": (
+        "We can see what was changed after an earlier save",
+        "This file kept its earlier version inside it, so we could compare the two. The text "
+        "listed actually changed between saves - something was edited after the document was "
+        "first written (and possibly after it was 'finalised' or signed).",
+        "Look at exactly what changed - a date, an amount, a name. Editing after finalising or "
+        "signing is the classic tampering pattern; confirm the change was legitimate."),
     "Data after end-of-file marker": (
         "Extra hidden data is attached after the document's end",
         "There are extra bytes tacked on after the point where the PDF is supposed to end. "
         "This can be harmless leftover data, or it can be a second file hidden inside this one.",
         "Have someone inspect the trailing bytes to confirm whether anything is hidden there."),
+    "Digital signature is broken (content changed after signing)": (
+        "The digital signature is broken - the file was changed after signing",
+        "This document carries a real cryptographic signature, and it no longer matches the "
+        "content. That means the file was altered after it was signed. Unlike most findings "
+        "here, this is definitive, not just a lead.",
+        "Do not rely on this document. Get the originally signed version from the signer."),
+    "Signature covers only part of the file": (
+        "The signature only covers part of the document",
+        "The document is signed and the signature itself is intact, but it only covers an "
+        "earlier version - content was added afterwards. This 'sign, then append more' pattern "
+        "is a classic way to make added material look signed when it isn't.",
+        "Treat anything beyond the signed portion as unsigned. Confirm the added content with "
+        "the signer."),
+    "Digital signature present and internally intact": (
+        "The document has a digital signature that checks out (so far)",
+        "This document has a real cryptographic signature, it matches the content, and it "
+        "appears to cover the whole file. That's good - but 'intact' isn't the same as "
+        "'trusted': we still can't confirm offline that the signer's certificate is genuine.",
+        "Do an online certificate/revocation check to confirm the signer is who they claim and "
+        "that the certificate is valid and not revoked."),
     "Digital signature object present": (
         "The file contains a digital signature",
         "This PDF includes a cryptographic (digital) signature. Whether that signature is "
@@ -982,6 +1413,30 @@ PLAIN_LANGUAGE = {
         "for another.",
         "Confirm the named source is legitimate and that no unrelated company or template is "
         "embedded in the document."),
+    "Last editor differs from the author": (
+        "Created by one person, last saved by another",
+        "The Office file records who created it and who last saved it, and they're different "
+        "people. That's normal for collaboration, but it matters if the two are supposed to be "
+        "independent parties.",
+        "Confirm both names are expected. If the parties should be independent, ask why one "
+        "edited the other's document."),
+    "Unaccepted tracked changes in the document": (
+        "The Word file still has un-finalised edits inside it",
+        "The document contains tracked changes that were never accepted or rejected. The text "
+        "on screen may not be the real final text, and the change history shows exactly what "
+        "was edited and by whom.",
+        "Open it in Word with tracked changes shown to see what was altered before trusting the "
+        "'final' wording."),
+    "Many save cycles": (
+        "The document was saved many times",
+        "The file's revision counter is high, meaning it went through many save cycles. Purely "
+        "contextual - it just indicates how heavily the document was worked on.",
+        "No action needed; use as background context."),
+    "Embedded company name": (
+        "A company name is stored in the file's properties",
+        "The Office file records a Company name in its properties. Worth a glance to confirm it "
+        "matches the party the document is supposed to be from.",
+        "Confirm the company name is the expected one."),
     "Authored and rendered by different tools": (
         "Written in one program and converted to PDF by another",
         "The document was authored in one tool (for example Microsoft Word) and turned into a "
@@ -995,6 +1450,14 @@ PLAIN_LANGUAGE = {
         "the page after the rest was written.",
         "Look at the page named below to see whether that text was inserted on top rather than "
         "typed into the document."),
+    "Same font name but two different font sources": (
+        "The same-named font actually comes from two different sources",
+        "A font with one name (say 'Arial') is embedded here from two different origins - "
+        "different foundry or version. Genuine single-source text uses one identical font "
+        "program throughout, so this is a sign that text from another document was spliced in "
+        "while keeping the same font name to hide it.",
+        "Look at the pages/sections using the second font source - that's where inserted or "
+        "pasted text is most likely."),
     "Mixed base fonts across the document": (
         "The document mixes fonts from more than one source",
         "Substantial amounts of text use different underlying font families. This can be "
@@ -1076,6 +1539,21 @@ PLAIN_LANGUAGE = {
         "hidden is fully readable.",
         "Recover the text to see what was meant to be hidden, and treat the redaction as "
         "failed. Do not rely on it."),
+    "Duplicated region within a scanned page (copy-move)": (
+        "Part of a scanned page looks copied-and-pasted onto itself",
+        "An area of this scanned page appears to be a duplicate of another area on the same "
+        "page - the fingerprint of 'copy-move' editing, where a value, box, or stamp is cloned "
+        "to cover or fake something. Documents with very repetitive layouts can also trigger "
+        "this, so it needs a visual check.",
+        "Compare the two matching areas on the page; if a number, signature, or stamp was "
+        "cloned, get the original."),
+    "Uneven noise across a scanned page": (
+        "Part of a scanned page is noisier than the rest",
+        "Every scan or photo has a fine, even 'grain' of noise. Here one area's grain is "
+        "clearly different from the rest of the page. A patch pasted in from another source "
+        "usually brings its own noise, so an uneven area can mark an inserted or edited region.",
+        "Look at the heatmap and check whether the odd area sits over text, a figure, or a "
+        "signature that could have been swapped; if so, get the original page."),
     "Possible edited region in a scanned page (ELA)": (
         "A scanned page may have been edited in one spot",
         "We ran Error-Level Analysis (a standard image-tampering test) on this scanned page. "

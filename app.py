@@ -75,7 +75,7 @@ def run_analysis(file_sigs, version=ANALYSIS_VERSION):
     """file_sigs: tuple of (name, sha, path). Cached by content + engine version."""
     results = {}
     for name, _sha, path in file_sigs:
-        results[name] = fe.analyze_document(path, name)
+        results[name] = fe.analyze_file(path, name)
     cross = fe.correlate_documents(results)
     return results, cross
 
@@ -88,7 +88,8 @@ def persist(uploaded):
     for uf in uploaded:
         data = uf.getvalue()
         sha = hashlib.sha256(data).hexdigest()[:16]
-        path = os.path.join(root, f"{sha}.pdf")
+        ext = os.path.splitext(uf.name)[1].lower() or ".pdf"
+        path = os.path.join(root, f"{sha}{ext}")
         if not os.path.exists(path):
             open(path, "wb").write(data)
         sigs.append((uf.name, sha, path))
@@ -793,8 +794,10 @@ with st.sidebar:
 # --------------------------------------------------------------------------- #
 # upload + run
 # --------------------------------------------------------------------------- #
-uploaded = st.file_uploader("Upload one or more PDFs (a full deal pack works best)",
-                            type=["pdf"], accept_multiple_files=True)
+uploaded = st.file_uploader(
+    "Upload one or more documents — PDF or Word/Excel/PowerPoint (a full deal pack works best)",
+    type=["pdf", "docx", "xlsx", "pptx", "docm", "xlsm", "pptm"],
+    accept_multiple_files=True)
 
 if not uploaded:
     st.info("Upload PDFs to begin. Uploading a whole set enables cross-document checks "

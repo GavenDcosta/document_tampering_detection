@@ -13,7 +13,11 @@ checklist of what still needs external verification.
 | Layer | Examples of what it flags |
 |-------|---------------------------|
 | File / byte | integrity hash, data hidden after `%%EOF` |
-| Structure | incremental updates (edits appended after saving), digital-signature objects |
+| Structure | incremental updates (edits appended after saving) + **a diff of what changed between revisions**, digital-signature objects |
+| Signatures | **cryptographic signature validation** (pyhanko): intact? covers whole file? signer name |
+| Fonts (glyph) | **same font name built from two different sources** (splice) via embedded-font fingerprint |
+| Image (raster) | **ELA heatmap**, **noise-inconsistency**, **copy-move (clone) detection** on scanned pages |
+| Office files | **.docx/.xlsx/.pptx**: author vs last-editor, revision count, template/company provenance, **unaccepted tracked changes** |
 | Metadata | author/tool/timestamps, print-to-PDF flattening, internal-title provenance leaks, modified-before-created |
 | Fonts | late-added font (possible overlay), mixed base fonts (multi-source assembly) |
 | Text | leftover template placeholders, overlaid/inserted fields (rare colour + odd font), fake redactions (dark box over dark text), near-white hidden text, multiple template vintages (footer dates) |
@@ -40,6 +44,13 @@ reader can spot an unexpected brand at a glance.
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
+```
+
+### Batch / CLI mode (no browser)
+
+```bash
+python forensics_engine.py ./docs/ --json report.json      # a folder
+python forensics_engine.py *.pdf                            # specific files
 ```
 
 ## Deploy on Streamlit Community Cloud (free)
