@@ -128,6 +128,12 @@ def render_card(f, src_path=None):
         f'<div class="d"><b>What it means:</b> {h["means"]}</div>'
         f'<div class="d"><b>What to do:</b> {h["action"]}</div></div>',
         unsafe_allow_html=True)
+    # Visual evidence: a generated image (e.g. ELA heatmap) carried on the finding
+    if f.get("image_png"):
+        try:
+            st.image(f["image_png"], caption="Analysis heatmap", width=320)
+        except Exception:
+            pass
     # Visual evidence: the actual image this finding is about
     ref = f.get("image_ref")
     if src_path and ref and ref[1] is not None:
@@ -497,6 +503,27 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix"):
             pdf.multi_cell(w=page_w - 8, h=4, text="Technical detail: " + tech)
         except Exception:
             pass
+
+        # Visual evidence: a generated image (e.g. an ELA heatmap) on the finding itself
+        gen = f.get("image_png")
+        if gen:
+            try:
+                from PIL import Image as _PImg
+                _im = _PImg.open(io.BytesIO(gen))
+                ar = (_im.height / _im.width) if _im.width else 0.5
+                disp_w = min(70, page_w - 10)
+                disp_h = min(disp_w * ar, 75)
+                if pdf.get_y() + disp_h + 6 > 275:
+                    pdf.add_page()
+                pdf.set_x(content_x)
+                pdf.set_font("helvetica", "B", 7)
+                pdf.set_text_color(*TEXT_SECONDARY)
+                pdf.cell(0, 4, "Analysis heatmap:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                iy = pdf.get_y()
+                pdf.image(io.BytesIO(gen), x=content_x, y=iy, w=disp_w, h=disp_h)
+                pdf.set_y(iy + disp_h + 1)
+            except Exception:
+                pass
 
         # Visual evidence: embed the actual image this finding is about
         ref = f.get("image_ref")
@@ -921,11 +948,19 @@ def report_basename(results):
 
 
 base = report_basename(results)
+
+
+def _json_findings(findings):
+    # drop raw image bytes so the JSON stays small and serialisable
+    return [{k: v for k, v in f.items() if k != "image_png"} for f in findings]
+
+
 d1, d2, d3 = st.columns(3)
 md = build_markdown(results, cross)
 json_blob = json.dumps(
-    {fn: {"summary": r["summary"], "findings": r["findings"]} for fn, r in results.items()}
-    | {"_cross_document": cross}, indent=2, default=str)
+    {fn: {"summary": r["summary"], "findings": _json_findings(r["findings"])}
+     for fn, r in results.items()}
+    | {"_cross_document": _json_findings(cross)}, indent=2, default=str)
 pdf_bytes = build_pdf_report(results, cross, paths=paths)
 
 d1.download_button("Download PDF report", pdf_bytes, file_name=f"{base}.pdf",

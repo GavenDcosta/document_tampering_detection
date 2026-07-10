@@ -51,18 +51,62 @@ DATE_RE = re.compile(
     re.I,
 )
 
+# Generic words that show up in document titles but are NOT company/brand names, so
+# they should not be treated as a "foreign brand" leaking through the internal title.
+GENERIC_TITLE_WORDS = {
+    "microsoft", "word", "excel", "powerpoint", "adobe", "acrobat", "pages", "quartz",
+    "pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt", "rtf",
+    "final", "draft", "copy", "rev", "revision", "version", "ver", "signed", "stamped",
+    "clean", "master", "template", "form",
+    "agreement", "distribution", "international", "term", "sheet", "firm", "commitment",
+    "deal", "summary", "memorandum", "association", "certificate", "incorporation",
+    "contract", "letter", "invoice", "statement", "report", "schedule", "exhibit",
+    "annex", "appendix", "addendum", "amendment", "the", "and", "for", "of", "to", "in",
+    "a", "an", "document", "new", "with",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december",
+}
+
+
+def _title_tokens(s):
+    """Word-ish tokens from a string, lowercased, length >= 3."""
+    return [w for w in re.split(r"[^A-Za-z0-9]+", s or "") if len(w) >= 3]
+
+
+def _foreign_brand_in_title(title, filename):
+    """Return a brand-like token in the internal title that is absent from the file
+    name (a possible foreign company/template), or None. Mixed-case tokens like
+    'MagnetTx' and unusual capitalised words are the strongest signals."""
+    fname_norm = re.sub(r"[^a-z0-9]", "", os.path.splitext(filename or "")[0].lower())
+    for raw in re.split(r"[^A-Za-z0-9]+", title or ""):
+        if len(raw) < 4:
+            continue
+        low = raw.lower()
+        if low in GENERIC_TITLE_WORDS or raw.isdigit():
+            continue
+        # brand-like: mixed-case (MagnetTx) OR a capitalised alphabetic word
+        mixed_case = raw != raw.lower() and raw != raw.upper()
+        capitalised = raw[:1].isupper() and raw.isalpha()
+        if not (mixed_case or capitalised):
+            continue
+        if low not in fname_norm:                 # not part of the document's own name
+            return raw
+    return None
+
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 def _finding(layer, severity, status, title, detail, page=None, section=None, evidence=None,
-             image_ref=None, image_refs=None):
+             image_ref=None, image_refs=None, image_png=None):
     # image_ref:  optional (page, xref) pointing at the single image this finding is about.
     # image_refs: optional list of (page, xref) when a finding is about several images
     #             (e.g. multiple distinct logos) — reports render them as a thumbnail row.
+    # image_png:  optional raw PNG bytes of a GENERATED image (e.g. an ELA heatmap) to embed
+    #             directly. Not serialised to JSON.
     return {"layer": layer, "severity": severity, "status": status, "title": title,
             "detail": detail, "page": page, "section": section, "evidence": evidence,
-            "image_ref": image_ref, "image_refs": image_refs}
+            "image_ref": image_ref, "image_refs": image_refs, "image_png": image_png}
 
 
 def _parse_pdf_date(s):
@@ -89,6 +133,33 @@ IMAGE_EDITORS = [
     "lightroom", "coreldraw", "paint.net", "photopea", "canva", "figma",
     "inkscape", "acorn", "sketch",
 ]
+
+
+def _ela(pil_img, quality=90, grid=8):
+    """Error-Level Analysis. Re-save as JPEG and diff; genuinely uniform (untouched)
+    scans show even, low residuals, while a pasted/edited region compresses
+    differently and lights up. Returns (heatmap_png_bytes, hotspot_ratio, max_block).
+    ELA is meaningful only for scanned/photographed rasters, not born-digital text.
+    """
+    from PIL import ImageChops, ImageEnhance
+    im = pil_img.convert("RGB")
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=quality)
+    buf.seek(0)
+    resaved = Image.open(buf)
+    ela = ImageChops.difference(im, resaved)
+    extrema = ela.getextrema()
+    max_diff = max(e[1] for e in extrema) or 1
+    ela = ImageEnhance.Brightness(ela).enhance(min(255.0 / max_diff, 20))
+    # localized-hotspot score: compare the brightest grid block to the median block
+    g = ela.convert("L").resize((grid, grid))
+    vals = sorted(g.tobytes())
+    median = vals[len(vals) // 2] or 1
+    max_block = vals[-1]
+    ratio = max_block / max(median, 1)
+    png = io.BytesIO()
+    ela.save(png, "PNG")
+    return png.getvalue(), ratio, max_block
 
 
 def _exif_summary(img):
@@ -320,6 +391,68 @@ def layer_drawings(doc, section_map):
     return findings
 
 
+def layer_watermarks(doc, text):
+    """Detect large, faint, repeated text (a watermark) and flag it if it appears on
+    only SOME pages — an inconsistent watermark can mean pages were swapped in/out."""
+    findings = []
+    if doc.page_count < 2:
+        return findings
+    body_size = text.get("dominant_size") or 10
+    # candidate watermark spans: large + light-grey (not black, not near-white)
+    wm_pages = defaultdict(set)
+    for (pno, y, t, font, size, color) in text["spans"]:
+        lum, (r, g, b) = _lum(color)
+        greyish = abs(r - g) < 25 and abs(g - b) < 25
+        if size >= body_size + 4 and greyish and 0.45 < lum < 0.9 and len(t) >= 3:
+            wm_pages[t.strip().lower()].add(pno)
+    for wtext, pages in wm_pages.items():
+        if len(pages) < 2:
+            continue
+        covered = len(pages)
+        total = doc.page_count
+        if covered < total:  # present on some but not all pages
+            findings.append(_finding(
+                "Watermark", "Medium", "REVIEW", "Watermark appears on only some pages",
+                f"A faint, large repeated mark reading '{wtext[:40]}' looks like a watermark, "
+                f"but it appears on {covered} of {total} pages rather than all of them. An "
+                f"inconsistent watermark can mean pages were added or replaced after the "
+                f"watermark was applied.",
+                evidence=f"'{wtext[:40]}' on {covered}/{total} pages"))
+    return findings
+
+
+def layer_redactions(doc, section_map):
+    """Redaction verification: a redaction annotation that still has extractable text
+    under it means the redaction was never actually applied (text is recoverable)."""
+    findings = []
+    for pno, page in enumerate(doc):
+        try:
+            annots = page.annots() or []
+        except Exception:
+            continue
+        for a in annots:
+            try:
+                atype = a.type[1].lower()
+            except Exception:
+                atype = ""
+            if "redact" not in atype:
+                continue
+            try:
+                sub = page.get_text("text", clip=a.rect).strip()
+            except Exception:
+                sub = ""
+            if sub:
+                findings.append(_finding(
+                    "Text", "High", "CONFIRMED", "Redaction not applied (text recoverable)",
+                    f"Page {pno+1} has a redaction mark, but the text underneath is still in "
+                    f"the file and can be copied out: '{sub[:50]}'. The redaction was marked "
+                    f"but never actually applied, so the 'hidden' information is fully "
+                    f"recoverable.",
+                    page=pno + 1, section=nearest_section(section_map, pno + 1, a.rect.y0),
+                    evidence=sub[:80]))
+    return findings
+
+
 # ---------------------------------------------------------------------------
 # rules -> findings for a single document
 # ---------------------------------------------------------------------------
@@ -387,18 +520,32 @@ def analyze_document(path, filename=None):
             f"(.docx/.xlsx) to see the real edit history.",
             evidence=f"Producer={producer}"))
 
-    # internal title reveals a source name / DMS id different from the filename
-    if title and (".docx" in title.lower() or ".doc" in title.lower() or
-                  re.search(r"\(\d{5,}\)", title) or re.search(r"\brev\s*\d+\b", title, re.I)):
-        stem = re.sub(r"[^a-z0-9]", "", os.path.splitext(filename)[0].lower())
-        tnorm = re.sub(r"[^a-z0-9]", "", title.lower())
-        note = ("Internal document title differs from the file name and exposes source/"
-                "template provenance (a source filename, revision, or document-management "
-                "number). Confirm the named source matches the represented party and that "
-                "no unrelated party/template is embedded.")
-        findings.append(_finding(
-            "Metadata", "Medium", "VERIFY", "Internal title exposes source provenance",
-            note, evidence=f"Title: {title}"))
+    # Internal title exposes source provenance. Distinguish a FOREIGN COMPANY/BRAND
+    # embedded in the title (serious - rebranded template) from just a source
+    # filename / revision number that matches the document's own branding (minor).
+    title_l = title.lower()
+    exposes_source = title and (
+        ".docx" in title_l or ".doc" in title_l or ".xls" in title_l or ".ppt" in title_l
+        or re.search(r"\(\d{5,}\)", title) or re.search(r"\brev\s*\d+\b", title, re.I))
+    if exposes_source:
+        foreign = _foreign_brand_in_title(title, filename)
+        if foreign:
+            findings.append(_finding(
+                "Metadata", "High", "VERIFY", "Internal name reveals a different company",
+                f"The document's hidden internal title names '{foreign}', which does not "
+                f"appear in the document's own file name or visible branding. A different "
+                f"company/brand embedded in the file's identity is a classic sign of a "
+                f"template that belonged to one party being reused or rebranded for another.",
+                evidence=f"Foreign name '{foreign}' in title: {title}"))
+        else:
+            findings.append(_finding(
+                "Metadata", "Low", "REVIEW", "Internal name reveals the source file / revision",
+                f"The document's hidden internal title exposes its source (a Word/Excel "
+                f"filename, a revision number, or a document-management id). The names match "
+                f"the document's own branding, so this is minor — it mainly confirms the PDF "
+                f"is a re-exported working file (for example a 'rev N' draft) rather than an "
+                f"original.",
+                evidence=f"Title: {title}"))
 
     if creator and producer and creator.lower() not in prod_l and "word" in creator.lower():
         findings.append(_finding(
@@ -510,7 +657,7 @@ def analyze_document(path, filename=None):
             f"were assembled from different template versions.",
             evidence=listing))
 
-    # ---- full-page raster inside a text PDF ----
+    # ---- full-page raster inside a text PDF (+ ELA on the scan) ----
     for im in imgs:
         if im["coverage"] > 0.8:
             txt_len = len(doc[im["page"] - 1].get_text("text").strip())
@@ -523,6 +670,39 @@ def analyze_document(path, filename=None):
                     page=im["page"], evidence=f"{im['w']}x{im['h']} covers "
                                               f"{int(im['coverage']*100)}% of page",
                     image_ref=(im["page"], im["xref"])))
+                # Error-Level Analysis on this scanned page (ELA is only meaningful
+                # on rasters like this, not on born-digital text).
+                try:
+                    raw = doc.extract_image(im["xref"])
+                    heat, ratio, mx = _ela(Image.open(io.BytesIO(raw["image"])))
+                    if ratio >= 4.0 and mx >= 25:
+                        findings.append(_finding(
+                            "Image", "Medium", "REVIEW",
+                            "Possible edited region in a scanned page (ELA)",
+                            f"Error-Level Analysis of the scanned page {im['page']} shows an "
+                            f"uneven compression pattern (one area is markedly brighter than "
+                            f"the rest). On a genuine single scan the pattern is even; a "
+                            f"localised bright patch can mean part of the page was pasted in "
+                            f"or edited. The heatmap is shown — a human should judge whether "
+                            f"the bright area lines up with text/numbers that could have been "
+                            f"altered.",
+                            page=im["page"], evidence=f"ELA hotspot ratio {ratio:.1f} "
+                                                      f"(max block {mx})",
+                            image_png=heat))
+                    else:
+                        findings.append(_finding(
+                            "Image", "Info", "REVIEW",
+                            "Error-Level Analysis heatmap (scanned page)",
+                            f"Error-Level Analysis was run on the scanned page {im['page']}. "
+                            f"The compression pattern looks fairly even (no strong localised "
+                            f"anomaly), which is consistent with a single untouched scan. The "
+                            f"heatmap is included so a human can still inspect it — bright "
+                            f"edges can be normal, bright patches over text warrant a look.",
+                            page=im["page"], evidence=f"ELA hotspot ratio {ratio:.1f} "
+                                                      f"(max block {mx})",
+                            image_png=heat))
+                except Exception:
+                    pass
 
     # ---- EXIF metadata inside embedded images (signatures / stamps / logos) ----
     # The same edited graphic (logo/stamp) can repeat on many pages; group by the
@@ -603,6 +783,12 @@ def analyze_document(path, filename=None):
             page=min(min(c["pages"]) for c in logo_clusters),
             evidence="; ".join(parts), image_refs=refs))
 
+    # ---- watermark consistency ----
+    findings.extend(layer_watermarks(doc, text))
+
+    # ---- redaction verification (annotations that didn't remove the text) ----
+    findings.extend(layer_redactions(doc, section_map))
+
     summary = {
         "file": filename,
         "pages": doc.page_count,
@@ -610,6 +796,7 @@ def analyze_document(path, filename=None):
         "created": str(cdate) if cdate else info.get("creationDate", ""),
         "sha256": ident["sha256"],
         "size": ident["size"],
+        "analyzed_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     return {"summary": summary, "findings": findings, "_images": imgs,
             "_created_dt": cdate, "_producer": producer, "_author": author}
@@ -771,6 +958,22 @@ PLAIN_LANGUAGE = {
         "mean it was edited - only that the PDF alone can't show us.",
         "Ask the sender for the original source file (the Word or Excel document), which keeps "
         "its real edit history."),
+    "Internal name reveals a different company": (
+        "A different company's name is hidden inside the file",
+        "The document's internal title (metadata you don't see on the page) names a company "
+        "or brand that isn't the one this document is supposed to be from, and isn't in its "
+        "file name. That is a classic fingerprint of one party's template being reused or "
+        "rebranded for another - the strongest version of this signal.",
+        "Confirm who that other company is and why its name is embedded. Treat it as a strong "
+        "lead until explained."),
+    "Internal name reveals the source file / revision": (
+        "The file's hidden internal name shows it's a re-exported working draft",
+        "The document's internal title exposes its source - a Word/Excel filename, a revision "
+        "number, or a document-management id. Here the names match the document's own party, "
+        "so it's minor: it mostly confirms this PDF is a re-exported working file (e.g. a "
+        "'rev 3' draft) rather than an original.",
+        "Low concern by itself. If it matters, ask for the original source file to confirm the "
+        "final content matches."),
     "Internal title exposes source provenance": (
         "The document's hidden internal name points to a different source",
         "Inside the file, the document's internal title names a different company, a source "
@@ -859,6 +1062,35 @@ PLAIN_LANGUAGE = {
         "bundle assembled from several different source files - so these PDFs are re-prints, not "
         "independently produced originals.",
         "Ask for the independent originals of each document from their respective sources."),
+    "Watermark appears on only some pages": (
+        "A watermark is on some pages but not others",
+        "A faint background watermark shows up on part of the document but not all of it. If a "
+        "watermark was applied to the whole original, pages missing it may have been inserted "
+        "or swapped in afterwards.",
+        "Check the pages without the watermark - confirm they belong to the same original "
+        "document."),
+    "Redaction not applied (text recoverable)": (
+        "A 'redacted' area can still be read",
+        "The document has a redaction mark, but the text underneath was never actually removed "
+        "- it's still in the file and can be copied straight out. Whatever was meant to be "
+        "hidden is fully readable.",
+        "Recover the text to see what was meant to be hidden, and treat the redaction as "
+        "failed. Do not rely on it."),
+    "Possible edited region in a scanned page (ELA)": (
+        "A scanned page may have been edited in one spot",
+        "We ran Error-Level Analysis (a standard image-tampering test) on this scanned page. "
+        "An untouched scan compresses evenly all over; here one area stands out, which can mean "
+        "part of the page - a number, a name, a stamp - was pasted in or altered. It is a lead, "
+        "not proof.",
+        "Look at the heatmap: if the bright area sits over text or figures that matter, get the "
+        "original of that page and compare."),
+    "Error-Level Analysis heatmap (scanned page)": (
+        "We checked this scanned page for signs of editing",
+        "We ran Error-Level Analysis (an image-tampering test) on this scanned page and did not "
+        "find a strong localised anomaly - consistent with a single untouched scan. The heatmap "
+        "is included so you can still eyeball it.",
+        "No action needed unless a bright patch lines up with important text; then obtain the "
+        "original page to compare."),
     "Multiple distinct logos / letterheads in one document": (
         "The document uses more than one logo / letterhead",
         "The pages don't all carry the same logo. A document produced from a single source "
@@ -956,14 +1188,16 @@ def build_executive_summary(results, cross):
             f"{names} was edited and re-saved after its first save, and the earlier version is "
             f"still inside the file. It should be reconstructed to see what changed.")
 
-    # 4. Provenance / rebrand
+    # 4. Provenance / rebrand — the serious case: a foreign company in the internal name
     prov = [fn for fn, r in results.items()
-            if any(f["title"] == "Internal title exposes source provenance" for f in r["findings"])]
+            if any(f["title"] == "Internal name reveals a different company"
+                   for f in r["findings"])]
     if prov:
         verb = "carry" if len(prov) > 1 else "carries"
         themes.append(
-            f"{', '.join(prov)} {verb} a hidden internal name that points to a different "
-            f"company, source file, or template than the document's own branding.")
+            f"{', '.join(prov)} {verb} a *different company's name* hidden inside the file "
+            f"(internal metadata), which doesn't match the document's own branding — a classic "
+            f"sign of a rebranded template. This is a strong lead worth explaining.")
 
     # 5. Overlaid values / leftover placeholders
     if has("Leftover template placeholder") or has("Overlaid / inserted text"):
@@ -1055,3 +1289,69 @@ def document_verdict(fn, r, cross):
     else:
         lead = "Minor notes only"
     return f"{lead}: {headline.lower()}."
+
+
+# ---------------------------------------------------------------------------
+# Batch CLI  (roadmap #14) — analyse files/folders without the web UI.
+#   python forensics_engine.py *.pdf --json report.json
+# Self-contained: uses only the engine (no Streamlit), so it runs in a pipeline.
+# ---------------------------------------------------------------------------
+def _cli():
+    import argparse, glob, json
+    ap = argparse.ArgumentParser(
+        description="Offline PDF tampering / fraud triage (batch mode).")
+    ap.add_argument("inputs", nargs="+", help="PDF files and/or directories")
+    ap.add_argument("--json", metavar="FILE", help="write full findings to this JSON file")
+    ap.add_argument("--quiet", action="store_true", help="only print the risk headline")
+    args = ap.parse_args()
+
+    paths = []
+    for inp in args.inputs:
+        if os.path.isdir(inp):
+            paths += sorted(glob.glob(os.path.join(inp, "*.pdf")))
+        elif inp.lower().endswith(".pdf"):
+            paths.append(inp)
+    if not paths:
+        print("No PDF files found.")
+        raise SystemExit(1)
+
+    results = {}
+    for p in paths:
+        name = os.path.basename(p)
+        try:
+            results[name] = analyze_document(p, name)
+        except Exception as e:
+            print(f"  ! failed to analyse {name}: {e}")
+    cross = correlate_documents(results)
+    summ = build_executive_summary(results, cross)
+
+    print("=" * 70)
+    print("DOCUMENT FORENSICS - BATCH REPORT")
+    print("=" * 70)
+    print(f"Files: {summ['n_files']}   Findings: {summ['n_findings']}   "
+          f"Need attention: {summ['n_high']}")
+    print(f"\n{summ['headline']}\n")
+    if not args.quiet:
+        if summ["themes"]:
+            print("What we found:")
+            for t in summ["themes"]:
+                print(f"  - {t}")
+        print("\nDocument-by-document:")
+        for fn, r in results.items():
+            print(f"  - {fn}: {document_verdict(fn, r, cross)}")
+            print(f"      sha256={r['summary']['sha256']}  "
+                  f"analyzed_at={r['summary'].get('analyzed_at','')}")
+
+    if args.json:
+        def _clean(ff):
+            return [{k: v for k, v in f.items() if k != "image_png"} for f in ff]
+        blob = {fn: {"summary": r["summary"], "findings": _clean(r["findings"])}
+                for fn, r in results.items()}
+        blob["_cross_document"] = _clean(cross)
+        with open(args.json, "w", encoding="utf-8") as fh:
+            json.dump(blob, fh, indent=2, default=str)
+        print(f"\nJSON written to {args.json}")
+
+
+if __name__ == "__main__":
+    _cli()
