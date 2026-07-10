@@ -1152,7 +1152,7 @@ for title, desc in fe.MANUAL_CHECKLIST:
     st.checkbox(f"{title} — {desc}", key=f"mc_{title}")
 
 # ---- AI Web Verification ----
-'''
+_ = '''
 st.subheader("AI Web Verification")
 st.caption("Uses Gemini 2.5 Flash and Google Search to verify entities (companies, names) found in the document anomalies.")
 api_key = st.secrets.get("GOOGLE_API_KEY")
