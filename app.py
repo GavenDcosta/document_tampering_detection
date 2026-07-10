@@ -345,14 +345,20 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix", ai
         for u, a in UNI.items():
             t = t.replace(u, a)
         t = t.encode("latin-1", "replace").decode("latin-1")
-        out = []
-        for word in t.split():
-            while len(word) > 50:
-                out.append(word[:50])
-                word = word[50:]
-            if word:
-                out.append(word)
-        return " ".join(out)
+        lines = []
+        for line in t.splitlines():
+            out = []
+            for word in line.split(" "):
+                if not word:
+                    out.append("")
+                    continue
+                while len(word) > 50:
+                    out.append(word[:50])
+                    word = word[50:]
+                if word:
+                    out.append(word)
+            lines.append(" ".join(out))
+        return "\n".join(lines)
 
     class PDF(FPDF):
         def header(self):
@@ -870,9 +876,8 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix", ai
             pdf.add_page()
         pdf.set_font("helvetica", "", 9)
         pdf.set_text_color(*TEXT_PRIMARY)
-        # Gemini often uses markdown, so clean it slightly for PDF
-        ai_text = clean(ai_report).replace("**", "")
-        pdf.multi_cell(0, 5, ai_text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        ai_text = clean(ai_report)
+        pdf.multi_cell(0, 5, ai_text, markdown=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(2)
 
     return bytes(pdf.output())
@@ -1068,26 +1073,34 @@ st.subheader("AI Web Verification")
 st.caption("Uses Gemini 2.5 Flash and Google Search to verify entities (companies, names) found in the document anomalies.")
 api_key = st.secrets.get("GOOGLE_API_KEY")
 
-if "ai_report" not in st.session_state:
-    if not api_key:
-        st.error("Please add GOOGLE_API_KEY to your .streamlit/secrets.toml file.")
-    else:
-        import ai_verifier
+if not api_key:
+    st.error("Please add GOOGLE_API_KEY to your .streamlit/secrets.toml file.")
+else:
+    import ai_verifier
+    import importlib
+    importlib.reload(ai_verifier)
+    findings_text = ""
+    for fn, r in results.items():
+        findings_text += f"\nFile: {fn}\n"
+        for f in r["findings"]:
+            findings_text += f"- {f['title']}: {f.get('detail', '')}\n"
+    for f in cross:
+        findings_text += f"- Cross-document: {f['title']}: {f.get('detail', '')}\n"
+    
+    current_hash = hash(findings_text)
+    if st.session_state.get("ai_report_hash") != current_hash:
         with st.spinner("Searching the web and analyzing findings..."):
-            findings_text = ""
-            for fn, r in results.items():
-                findings_text += f"\nFile: {fn}\n"
-                for f in r["findings"]:
-                    findings_text += f"- {f['title']}: {f.get('detail', '')}\n"
-            for f in cross:
-                findings_text += f"- Cross-document: {f['title']}: {f.get('detail', '')}\n"
-                 
             ai_report = ai_verifier.verify_findings_with_ai(findings_text, api_key)
             st.session_state["ai_report"] = ai_report
+            st.session_state["ai_report_hash"] = current_hash
 
 if "ai_report" in st.session_state:
     st.markdown("### AI Verification Results")
     st.markdown(st.session_state["ai_report"])
+    if st.button("🔄 Force Re-run AI Verification"):
+        if "ai_report_hash" in st.session_state:
+            del st.session_state["ai_report_hash"]
+        st.rerun()
 
 # ---- downloads ----
 st.subheader("Export report")

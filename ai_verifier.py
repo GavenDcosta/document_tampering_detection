@@ -16,20 +16,34 @@ I have analyzed a document and found the following anomalies and flags:
 
 {findings_text}
 
-Your task is to use Google Search to verify the web-verifiable claims in these findings. 
-Specifically:
-1. Verify individuals: Check if mentioned names (e.g., in missing signatures) belong to the mentioned companies. **CRITICAL:** Cross-check each person's name against ALL companies mentioned in the document flags (e.g., check if Roger Jewett is the CFO of MagnetTx, not just Akesis). Check LinkedIn or news.
+1. Verify individuals: Check if mentioned names (e.g., in missing signatures) belong to the mentioned companies. **CRITICAL:** You MUST aggressively cross-check each person's name against ALL companies mentioned in the document flags (Akesis, Radiosurgery Global, and especially MagnetTx). 
+   - Explicitly execute searches like: `"Roger Jewett" "MagnetTx"` and `"Jean-Luc Devleeschauwer" "MagnetTx"`.
+   - If you cannot find them initially, you MUST use targeted search operators like `site:magnettx.com "Roger Jewett"` or `site:linkedin.com "Roger Jewett" MagnetTx`. 
 2. Verify companies: Check if foreign company names found in metadata (e.g., MagnetTx) have any known relationships (mergers, partnerships, parent company) with the primary companies (e.g., Akesis, Radiosurgery Global). 
-3. Cite your sources: Provide the URL links to the LinkedIn profiles, news articles, or company pages you used to verify these claims.
-4. Ignore purely offline/internal recommendations like "Ask for the original Word document" or "Check for text overlay." Focus ONLY on what can be searched on the web.
+   - Explicitly execute searches like: `"MagnetTx" "Akesis" partnership` and `"MagnetTx" "Akesis" alliance`.
+3. Ignore purely offline/internal recommendations like "Ask for the original Word document" or "Check for text overlay." Focus ONLY on what can be searched on the web.
 
-Provide a concise, professional report of your web verification results. Be clear about what you could confirm, what you couldn't, and what it implies. ALWAYS include source URLs.
+You MUST format your response exactly like this:
+### 1. Individuals
+- **[Name]**: [Findings regarding this person and all companies. Was there a match?]
+
+### 2. Companies & Relationships
+- **[Company Name]**: [Findings regarding partnerships or connections]
+
+### 3. Conclusion
+- [Brief summary of whether these findings explain the anomalies or if they remain suspicious]
+
+### 4. Sources (MANDATORY)
+- [URL 1] - [What this link proves]
+- [URL 2] - [What this link proves]
+- (You MUST provide the exact URLs you found in your Google Search. Do not skip this section.)
 """
         
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
+                temperature=0.0,
                 tools=[{"google_search": {}}],
             )
         )
