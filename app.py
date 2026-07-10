@@ -51,10 +51,11 @@ st.markdown('<div class="sub">Offline PDF analysis across nine layers: file, str
             'metadata, fonts, text, annotations, image, cross-document, and a verification '
             'checklist for what can only be confirmed externally.</div>',
             unsafe_allow_html=True)
-st.markdown('<div class="disc"><b>Read this first.</b> This tool <b>surfaces anomalies for a '
-            'human examiner — it does not prove fraud or intent.</b> A flag is a question. '
-            'Confirmed items are reproducible facts; Review / Verify items need your judgment '
-            'or the source files.</div>', unsafe_allow_html=True)
+st.markdown('<div class="disc"><b>Read this first.</b> Findings come in two tiers. '
+            '<b>Established facts</b> are definitive and reproducible — anyone re-running the '
+            'check gets the same result. <b>Anomalies requiring judgment</b> are genuine leads '
+            'that a human must interpret. Stating a fact as a fact is fine; declaring "fraud" is '
+            'a legal conclusion this tool does not make.</div>', unsafe_allow_html=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -170,18 +171,24 @@ def build_markdown(results, cross):
     summary = fe.build_executive_summary(results, cross)
     L.append("## In plain English\n")
     L.append(f"**{summary['headline']}**\n")
+    if summary.get("established_facts"):
+        L.append("### Established facts (definitive, reproducible)\n")
+        for t in summary["established_facts"]:
+            L.append(f"- **{t}**")
+        L.append("")
     if summary["themes"]:
-        L.append("**What we found**\n")
+        L.append("### Anomalies requiring judgment\n")
         for t in summary["themes"]:
             L.append(f"- {t}")
         L.append("")
     if summary["actions"]:
-        L.append("**What to do next**\n")
+        L.append("### What to do next\n")
         for a in summary["actions"]:
             L.append(f"- {a}")
         L.append("")
-    L.append("_A flag is a question, not a verdict. These are anomalies for a human to "
-             "weigh, not proof of fraud or intent._\n")
+    L.append("_Findings are split into two tiers: **established facts** are proven and "
+             "reproducible; **anomalies requiring judgment** are genuine leads a human must "
+             "weigh. Neither, on its own, is a legal finding of fraud or intent._\n")
 
     # ---- one-line verdict per document ----
     L.append("## Document-by-document\n")
@@ -315,7 +322,6 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix"):
     BRAND_ACCENT = (59, 130, 246)   # blue-500
     WHITE = (255, 255, 255)
     LIGHT_BG = (241, 245, 249)      # slate-100
-    CARD_BG = (248, 250, 252)       # slate-50
     TEXT_PRIMARY = (30, 41, 59)      # slate-800
     TEXT_SECONDARY = (100, 116, 139) # slate-500
     SEV = {
@@ -603,7 +609,8 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix"):
     pdf.set_xy(pdf.l_margin + 3, pdf.get_y() + 2)
     safe_cell(f"Report Date: {datetime.datetime.now():%B %d, %Y at %H:%M}", size=9, color=TEXT_PRIMARY)
     pdf.set_x(pdf.l_margin + 3)
-    safe_cell("This offline analysis surfaces anomalies for human review. It does not prove fraud or intent.",
+    safe_cell("Findings are given in two tiers: established facts (definitive, reproducible) and "
+              "anomalies requiring human judgment. Neither alone is a legal finding of fraud.",
               style="I", size=8, color=TEXT_SECONDARY)
     pdf.ln(4)
 
@@ -656,23 +663,25 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix"):
     safe_multi(summ["headline"], style="B", size=9.5, color=TEXT_PRIMARY)
     pdf.ln(1)
 
-    def bullet_list(title, items):
+    def bullet_list(title, items, bold_items=False, title_color=None):
         if not items:
             return
         pdf.set_font("helvetica", "B", 8.5)
-        pdf.set_text_color(*BRAND_DARK)
+        pdf.set_text_color(*(title_color or BRAND_DARK))
         pdf.cell(0, 5, title, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         for it in items:
             if pdf.get_y() > 255:
                 pdf.add_page()
-            pdf.set_font("helvetica", "", 8.5)
+            pdf.set_font("helvetica", "B" if bold_items else "", 8.5)
             pdf.set_text_color(*TEXT_PRIMARY)
             pdf.set_x(pdf.l_margin + 2)
             pdf.multi_cell(w=page_w - 4, h=4.5, text="- " + clean(it))
             pdf.ln(0.5)
         pdf.ln(1)
 
-    bullet_list("What we found", summ["themes"])
+    bullet_list("Established facts (definitive, reproducible)",
+                summ.get("established_facts"), bold_items=True, title_color=SEV["High"])
+    bullet_list("Anomalies requiring judgment", summ["themes"])
     bullet_list("What to do next", summ["actions"])
 
     # -- Document-by-document verdicts --
@@ -825,14 +834,20 @@ c5.metric("To verify", n_verify)
 summary = fe.build_executive_summary(results, cross)
 st.subheader("In plain English")
 st.markdown(f"**{summary['headline']}**")
+if summary.get("established_facts"):
+    st.markdown("**✔ Established facts** — definitive and reproducible; anyone re-running the "
+                "check gets the same result:")
+    st.markdown("\n".join(f"- {t}" for t in summary["established_facts"]))
 if summary["themes"]:
-    st.markdown("**What we found**")
+    st.markdown("**⚠ Anomalies requiring judgment** — real signals, but a human must decide "
+                "what they mean:")
     st.markdown("\n".join(f"- {t}" for t in summary["themes"]))
 if summary["actions"]:
     st.markdown("**What to do next**")
     st.markdown("\n".join(f"- {a}" for a in summary["actions"]))
-st.caption("A flag is a question, not a verdict. These are anomalies for a human to weigh — "
-           "not proof of fraud or intent.")
+st.caption("Findings are split into two tiers: **established facts** are proven and reproducible; "
+           "**anomalies requiring judgment** are genuine leads a human must weigh. Neither, on "
+           "its own, is a legal finding of fraud or intent.")
 st.divider()
 
 # ---- per-document one-line verdicts ----

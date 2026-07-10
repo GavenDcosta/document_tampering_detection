@@ -14,10 +14,11 @@ checklist of what still needs external verification.
 |-------|---------------------------|
 | File / byte | integrity hash, data hidden after `%%EOF` |
 | Structure | incremental updates (edits appended after saving) + **a diff of what changed between revisions**, digital-signature objects |
-| Signatures | **cryptographic signature validation** (pyhanko): intact? covers whole file? signer name |
+| Signatures | **cryptographic signature validation** (pyhanko): intact? covers whole file? signer name; **signature-block completion** — which named party signed vs. left it blank (position-aware, two-column safe) |
 | Fonts (glyph) | **same font name built from two different sources** (splice) via embedded-font fingerprint |
 | Image (raster) | **ELA heatmap**, **noise-inconsistency**, **copy-move (clone) detection** on scanned pages |
-| Office files | **.docx/.xlsx/.pptx**: author vs last-editor, revision count, template/company provenance, **unaccepted tracked changes** |
+| OCR (text in images) | **reads text inside stamps/logos/scanned pages** (RapidOCR) and flags a company/brand named in a logo that isn't in the document's own text; surfaces scanned-page text for checking |
+| Office files | **.docx/.xlsx/.pptx**: author vs last-editor, revision count, template/company provenance, **unaccepted tracked changes**, and now **embedded images** (EXIF + OCR + cross-doc reuse) |
 | Metadata | author/tool/timestamps, print-to-PDF flattening, internal-title provenance leaks, modified-before-created |
 | Fonts | late-added font (possible overlay), mixed base fonts (multi-source assembly) |
 | Text | leftover template placeholders, overlaid/inserted fields (rare colour + odd font), fake redactions (dark box over dark text), near-white hidden text, multiple template vintages (footer dates) |

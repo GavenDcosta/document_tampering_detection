@@ -68,30 +68,233 @@ GENERIC_TITLE_WORDS = {
 }
 
 
+# Place names and web/legal-suffix words that look brand-like but are not a company,
+# so the entity-comparison (esp. on OCR'd stamp text) doesn't false-positive on them.
+PLACE_WORDS = {
+    "london", "munich", "delhi", "newdelhi", "singapore", "jakarta", "dubai", "india",
+    "uae", "emirates", "abudhabi", "california", "mumbai", "york", "newyork", "paris",
+    "tokyo", "beijing", "shanghai", "germany", "france", "england", "britain", "usa",
+    "america", "kingdom", "united", "states", "county", "street", "road", "avenue",
+    "crescent", "house", "floor", "suite",
+}
+WEB_SUFFIX_WORDS = {
+    "www", "http", "https", "com", "org", "net", "email", "info", "mail", "tel", "fax",
+    "phone", "ltd", "limited", "inc", "incorporated", "llc", "gmbh", "plc", "corp",
+    "corporation", "company", "group", "holdings", "global",
+}
+
+
 def _title_tokens(s):
     """Word-ish tokens from a string, lowercased, length >= 3."""
     return [w for w in re.split(r"[^A-Za-z0-9]+", s or "") if len(w) >= 3]
 
 
-def _foreign_brand_in_title(title, filename):
-    """Return a brand-like token in the internal title that is absent from the file
-    name (a possible foreign company/template), or None. Mixed-case tokens like
-    'MagnetTx' and unusual capitalised words are the strongest signals."""
-    fname_norm = re.sub(r"[^a-z0-9]", "", os.path.splitext(filename or "")[0].lower())
-    for raw in re.split(r"[^A-Za-z0-9]+", title or ""):
+def _foreign_brand(text, reference_norm, extra_stop=()):
+    """Return a brand-like token in `text` that is absent from `reference_norm`
+    (a normalised, alnum-only reference string), or None. Mixed-case tokens like
+    'MagnetTx' and unusual capitalised words are the strongest signals. Generic,
+    place, and web/suffix words are ignored so it doesn't fire on cities/URLs."""
+    for raw in re.split(r"[^A-Za-z0-9]+", text or ""):
         if len(raw) < 4:
             continue
         low = raw.lower()
-        if low in GENERIC_TITLE_WORDS or raw.isdigit():
+        if (low in GENERIC_TITLE_WORDS or low in PLACE_WORDS or low in WEB_SUFFIX_WORDS
+                or low in extra_stop or raw.isdigit()):
             continue
         # brand-like: mixed-case (MagnetTx) OR a capitalised alphabetic word
         mixed_case = raw != raw.lower() and raw != raw.upper()
         capitalised = raw[:1].isupper() and raw.isalpha()
         if not (mixed_case or capitalised):
             continue
-        if low not in fname_norm:                 # not part of the document's own name
+        if low not in reference_norm:              # not present in the reference text
             return raw
     return None
+
+
+def _foreign_brand_in_title(title, filename):
+    """Foreign brand in the internal title vs the file name (used by metadata checks)."""
+    fname_norm = re.sub(r"[^a-z0-9]", "", os.path.splitext(filename or "")[0].lower())
+    return _foreign_brand(title, fname_norm)
+
+
+# ---------------------------------------------------------------------------
+# OCR — read text INSIDE images (stamps, signatures, scanned pages). RapidOCR is
+# pure-pip (no system binary) and light enough for the Streamlit free tier. The
+# model is loaded once per process (lazy) so reruns don't reload it.
+# ---------------------------------------------------------------------------
+_OCR = None
+_OCR_TRIED = False
+
+
+def _get_ocr():
+    global _OCR, _OCR_TRIED
+    if _OCR_TRIED:
+        return _OCR
+    _OCR_TRIED = True
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        _OCR = RapidOCR()
+    except Exception:
+        _OCR = None
+    return _OCR
+
+
+def _ocr_foreign_entity(text, native_words):
+    """Find a distinctive company/brand name inside OCR'd image text that is NOT in the
+    document. Robust to OCR noise: only MIXED-CASE brandmarks (stamps/seals/cities come
+    out ALL-CAPS, so they're skipped), and fuzzy-matched against the document's words so
+    an OCR misread of a name that IS in the document doesn't false-positive."""
+    import difflib
+    for raw in re.split(r"[^A-Za-z0-9]+", text or ""):
+        if len(raw) < 4 or raw.isdigit():
+            continue
+        low = raw.lower()
+        if low in GENERIC_TITLE_WORDS or low in PLACE_WORDS or low in WEB_SUFFIX_WORDS:
+            continue
+        # distinctive brandmark = mixed case (has both cases); reject ALL-CAPS / all-lower
+        if raw == raw.upper() or raw == raw.lower():
+            continue
+        if low in native_words:
+            continue
+        if difflib.get_close_matches(low, list(native_words), n=1, cutoff=0.84):
+            continue                              # likely an OCR misread of a doc word
+        return raw
+    return None
+
+
+def _fuzzy_in(word, hay):
+    """Is `word` approximately present as a substring of `hay`? Tolerant of the OCR
+    concatenation/misreads that turn 'RADIOSURGERY GLOBAL' into 'RADIOSURCERYGLOBAL'."""
+    if len(word) < 5 or not hay:
+        return False
+    if word in hay:
+        return True
+    import difflib
+    L = len(word)
+    for i in range(0, max(len(hay) - L + 1, 1)):
+        if difflib.SequenceMatcher(None, word, hay[i:i + L + 2]).ratio() >= 0.8:
+            return True
+    return False
+
+
+def _stamp_name_overlap(text, native_text):
+    """Distinctive document entity words that appear (fuzzily) inside a stamp's text —
+    i.e. the stamp names a party the document is actually about. Checks every distinctive
+    long word (>=8 chars) so it works whether the party name is frequent or rare, and is
+    tolerant of the OCR concatenation/misreads in stamp text."""
+    stamp_norm = re.sub(r"[^a-z0-9]", "", (text or "").lower())
+    words = {w for w in re.split(r"[^a-z0-9]+", (native_text or "").lower())
+             if len(w) >= 8 and w not in GENERIC_TITLE_WORDS
+             and w not in PLACE_WORDS and w not in WEB_SUFFIX_WORDS}
+    return sorted({w for w in words if _fuzzy_in(w, stamp_norm)})[:3]
+
+
+def _ocr_image(pil_img, max_dim=1600):
+    """Run OCR on a PIL image; return [(text, confidence), ...]. Caps resolution to
+    keep memory/CPU bounded on the free tier."""
+    ocr = _get_ocr()
+    if ocr is None:
+        return []
+    import numpy as np
+    im = pil_img.convert("RGB")
+    if max(im.size) > max_dim:
+        r = max_dim / max(im.size)
+        im = im.resize((max(int(im.width * r), 1), max(int(im.height * r), 1)))
+    try:
+        res, _ = ocr(np.asarray(im))
+    except Exception:
+        return []
+    out = []
+    for item in (res or []):
+        try:
+            out.append((str(item[1]), float(item[2])))
+        except Exception:
+            pass
+    return out
+
+
+def layer_ocr(imgs, native_text, extract_pil, max_images=20):
+    """Read text inside images and compare stamp/logo text against the document's own
+    entities. Returns (findings, {sha16: ocr_text}).
+      * logo/stamp images  -> flag a company/brand named in the image but NOT in the doc
+      * full-page scans     -> surface the OCR'd text so it can be read/checked
+    """
+    if _get_ocr() is None:
+        return [], {}
+    native_words = {w for w in re.split(r"[^a-z0-9]+", (native_text or "").lower())
+                    if len(w) >= 4}
+    findings, ocr_texts, seen, n = [], {}, set(), 0
+    for im in imgs:
+        sha = im.get("sha16")
+        if sha in seen:
+            continue
+        seen.add(sha)
+        w, h = im.get("w") or 0, im.get("h") or 0
+        if w * h < 40 * 40:                      # skip tiny icons
+            continue
+        if n >= max_images:
+            break
+        pil = extract_pil(im)
+        if pil is None:
+            continue
+        toks = _ocr_image(pil)
+        text = " ".join(t for t, _c in toks).strip()
+        if not text:
+            continue
+        n += 1
+        ocr_texts[sha] = text
+        page = im.get("page")
+        ref = (page, im.get("xref")) if im.get("xref") is not None else None
+        png = im.get("_png")                     # Office images carry their own bytes
+        if im.get("coverage", 0) > 0.8:
+            snippet = re.sub(r"\s+", " ", text)[:220]
+            findings.append(_finding(
+                "Image", "Info", "REVIEW", "Text read from a scanned page (OCR)",
+                f"Page {page} is a scanned image with no digital text, so OCR was used to read "
+                f"it. It reads: \"{snippet}\". OCR can misread characters, so treat exact "
+                f"figures and names as read-with-care, not certified.",
+                page=page, evidence=f"OCR ({len(text)} chars): {snippet}",
+                image_ref=ref, image_png=png))
+        else:
+            foreign = _ocr_foreign_entity(text, native_words)
+            where = f" on page {page}" if page else " in this file"
+            if foreign:
+                findings.append(_finding(
+                    "Image", "Medium", "REVIEW",
+                    "A logo or stamp names a company not in the document",
+                    f"OCR read the text inside a graphic{where} and it names '{foreign}', which "
+                    f"does not appear anywhere in the document's own text. A logo or stamp for a "
+                    f"different company than the document is about is a strong provenance flag — "
+                    f"you can see it on the page, not just in the metadata.",
+                    page=page,
+                    evidence=f"image text reads '{text[:60]}'; '{foreign}' not in document text",
+                    image_ref=ref, image_png=png))
+            else:
+                # Positive read-out for a signature/stamp (mid-page image, not a header
+                # logo): always show what it says, and whether the name(s) match the doc.
+                rel_y = im.get("rel_y")
+                is_stamp = rel_y is None or rel_y > 0.2
+                if is_stamp and len(text.split()) >= 2 and re.search(r"[A-Za-z]{4}", text):
+                    overlap = _stamp_name_overlap(text, native_text)
+                    snippet = re.sub(r"\s+", " ", text)[:90]
+                    if overlap:
+                        title = "Signature/stamp read — name matches the document"
+                        verdict = (f"The name(s) it contains ({', '.join(overlap)}) do appear in "
+                                   f"this document, so the stamp is consistent with the party "
+                                   f"the document is about.")
+                    else:
+                        title = "Signature/stamp read — confirm the name"
+                        verdict = ("We could not automatically match a company/party name on it "
+                                   "to this document's text — confirm the name on the stamp is "
+                                   "the party this document is meant to be from.")
+                    findings.append(_finding(
+                        "Image", "Info", "REVIEW", title,
+                        f"A signature or stamp{where} was read by OCR. It reads: \"{snippet}\". "
+                        f"{verdict} (A reused signature can still be legitimate — this only "
+                        f"checks the name printed on it.)",
+                        page=page, evidence=f"stamp text: {snippet}",
+                        image_ref=ref, image_png=png))
+    return findings, ocr_texts
 
 
 # ---------------------------------------------------------------------------
@@ -619,6 +822,68 @@ def layer_watermarks(doc, text):
     return findings
 
 
+def layer_signature_blocks(doc):
+    """Detect signature blocks a named party has NOT completed (no signature image and
+    no date). Position-aware so two-column blocks are attributed to the right person.
+    An agreement executed by only some parties is a first-order underwriting flag."""
+    findings = []
+    NON_SIGNATORY = re.compile(
+        r"\b(ltd|inc|llc|limited|gmbh|corp|company|investments|global|representative|"
+        r"contact|quality|authorized|authorised|print|below)\b|[()]", re.I)
+    for pno, page in enumerate(doc):
+        ptext = page.get_text("text")
+        # signature context: explicit signature words, or a By:/Title: execution block
+        if not (re.search(r"signature|signed|on behalf of|\(signature\)", ptext, re.I) or
+                (re.search(r"\bby\s*:", ptext, re.I) and re.search(r"\btitle\s*[:.]", ptext, re.I))):
+            continue
+        ph = page.rect.height or 1
+        names, dates = [], []
+        for b in page.get_text("dict")["blocks"]:
+            for l in b.get("lines", []):
+                t = "".join(s["text"] for s in l["spans"]).strip()
+                if not t:
+                    continue
+                x, y = l["bbox"][0], l["bbox"][1]
+                mn = re.match(r"name\s*[:.]?\s*(.+)$", t, re.I)
+                md = re.match(r"date\s*[:.]?\s*(.*)$", t, re.I)
+                if mn:
+                    v = mn.group(1).strip()
+                    if (v and 1 <= len(v.split()) <= 4 and re.search(r"[A-Za-z]{3}", v)
+                            and not NON_SIGNATORY.search(v)):
+                        names.append((x, y, v))
+                elif md and re.search(r"\d{2}", md.group(1) or ""):
+                    dates.append((x, y))
+        if not names:
+            continue
+        sig_imgs = []           # small (non-full-page) images = candidate signatures/stamps
+        for im in page.get_images(full=True):
+            try:
+                for r in page.get_image_rects(im[0]):
+                    if r.height / ph < 0.5:
+                        sig_imgs.append((r.x0, r.y0, r.y1))
+            except Exception:
+                pass
+        unsigned = []
+        for nx, ny, name in names:
+            dated = any(abs(dx - nx) < 110 and ny - 10 < dy < ny + 95 for dx, dy in dates)
+            has_img = any(abs(ix - nx) < 130 and (ny - 135 < iy1 and iy0 < ny + 175)
+                          for ix, iy0, iy1 in sig_imgs)
+            if not (dated or has_img):
+                unsigned.append(name)
+        unsigned = list(dict.fromkeys(unsigned))
+        if unsigned:
+            one = len(unsigned) == 1
+            findings.append(_finding(
+                "Signature", "High", "REVIEW", "Signature block appears unsigned",
+                f"On page {pno+1}, the signature block for {', '.join(unsigned)} has no "
+                f"signature and no date filled in — {'this party appears' if one else 'these parties appear'} "
+                f"not to have executed the document. An agreement signed by only some of its "
+                f"parties may not be binding.",
+                page=pno + 1,
+                evidence=f"unsigned/undated: {', '.join(unsigned)} (page {pno+1})"))
+    return findings
+
+
 def layer_redactions(doc, section_map):
     """Redaction verification: a redaction annotation that still has extractable text
     under it means the redaction was never actually applied (text is recoverable)."""
@@ -756,20 +1021,20 @@ def analyze_document(path, filename=None):
         foreign = _foreign_brand_in_title(title, filename)
         if foreign:
             findings.append(_finding(
-                "Metadata", "High", "VERIFY", "Internal name reveals a different company",
+                "Metadata", "High", "CONFIRMED", "Internal name reveals a different company",
                 f"The document's hidden internal title names '{foreign}', which does not "
-                f"appear in the document's own file name or visible branding. A different "
-                f"company/brand embedded in the file's identity is a classic sign of a "
-                f"template that belonged to one party being reused or rebranded for another.",
+                f"appear in the document's own file name or visible branding. That the name is "
+                f"embedded is a reproducible fact; the reading — that it is a template belonging "
+                f"to one party reused/rebranded for another — is the classic interpretation.",
                 evidence=f"Foreign name '{foreign}' in title: {title}"))
         else:
             findings.append(_finding(
                 "Metadata", "Low", "REVIEW", "Internal name reveals the source file / revision",
-                f"The document's hidden internal title exposes its source (a Word/Excel "
-                f"filename, a revision number, or a document-management id). The names match "
-                f"the document's own branding, so this is minor — it mainly confirms the PDF "
-                f"is a re-exported working file (for example a 'rev N' draft) rather than an "
-                f"original.",
+                "The document's hidden internal title exposes its source (a Word/Excel "
+                "filename, a revision number, or a document-management id). The names match "
+                "the document's own branding, so this is minor — it mainly confirms the PDF "
+                "is a re-exported working file (for example a 'rev N' draft) rather than an "
+                "original.",
                 evidence=f"Title: {title}"))
 
     if creator and producer and creator.lower() not in prod_l and "word" in creator.lower():
@@ -1047,11 +1312,32 @@ def analyze_document(path, filename=None):
     except Exception:
         pass
 
+    # ---- OCR: read text inside images (stamps/logos/scans) & compare to entities ----
+    ocr_texts = {}
+    try:
+        native = " ".join(sp[2] for sp in text["spans"])
+
+        def _pil_from_pdf(im):
+            try:
+                return Image.open(io.BytesIO(doc.extract_image(im["xref"])["image"]))
+            except Exception:
+                return None
+        ocr_findings, ocr_texts = layer_ocr(imgs, native, _pil_from_pdf)
+        findings.extend(ocr_findings)
+    except Exception:
+        pass
+
     # ---- watermark consistency ----
     findings.extend(layer_watermarks(doc, text))
 
     # ---- redaction verification (annotations that didn't remove the text) ----
     findings.extend(layer_redactions(doc, section_map))
+
+    # ---- signature-block completion (who signed vs left it blank) ----
+    try:
+        findings.extend(layer_signature_blocks(doc))
+    except Exception:
+        pass
 
     summary = {
         "file": filename,
@@ -1063,7 +1349,8 @@ def analyze_document(path, filename=None):
         "analyzed_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     return {"summary": summary, "findings": findings, "_images": imgs,
-            "_created_dt": cdate, "_producer": producer, "_author": author}
+            "_created_dt": cdate, "_producer": producer, "_author": author,
+            "_ocr_texts": ocr_texts}
 
 
 # ---------------------------------------------------------------------------
@@ -1106,6 +1393,34 @@ def _iso(s):
         return None
 
 
+def _office_images(path):
+    """Extract embedded images from an OOXML file (word/xl/ppt media) so the same
+    image pipeline (EXIF, perceptual hash, OCR, cross-doc reuse) runs on them."""
+    import zipfile
+    out = []
+    try:
+        with zipfile.ZipFile(path) as z:
+            for name in z.namelist():
+                if not re.search(r"(word|xl|ppt)/media/", name, re.I):
+                    continue
+                if not name.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp")):
+                    continue                      # skip emf/wmf (PIL can't open)
+                try:
+                    data = z.read(name)
+                    pil = Image.open(io.BytesIO(data))
+                    out.append({
+                        "page": None, "xref": None, "name": name,
+                        "w": pil.width, "h": pil.height, "coverage": 0.0, "rel_y": None,
+                        "sha16": hashlib.sha256(data).hexdigest()[:16],
+                        "dhash": _dhash(pil), "exif": _exif_summary(pil), "_png": data,
+                    })
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return out
+
+
 def analyze_office(path, filename=None):
     filename = filename or os.path.basename(path)
     data = open(path, "rb").read()
@@ -1145,11 +1460,11 @@ def analyze_office(path, filename=None):
         foreign = _foreign_brand_in_title(template, filename)
         if foreign:
             findings.append(_finding(
-                "Metadata", "High", "VERIFY", "Internal name reveals a different company",
+                "Metadata", "High", "CONFIRMED", "Internal name reveals a different company",
                 f"The document is built on a template named '{template}', which carries the "
                 f"name '{foreign}' — a company/brand that isn't this document's own. A template "
                 f"from another party is a classic rebrand fingerprint.",
-                evidence=f"Template={template}"))
+                evidence=f"Foreign name '{foreign}' in title: {template}"))
 
     # company field
     if company and _foreign_brand_in_title(company, filename):
@@ -1181,6 +1496,31 @@ def analyze_office(path, filename=None):
             f"what prints, and the change history reveals what was edited.",
             evidence=f"w:ins={ins} w:del={dele}"))
 
+    # ---- embedded images: EXIF + OCR + populate _images for cross-doc reuse ----
+    imgs = _office_images(path)
+    ocr_texts = {}
+    for im in imgs:
+        soft = ((im.get("exif") or {}).get("software") or "").strip()
+        if soft and any(tool in soft.lower() for tool in IMAGE_EDITORS):
+            findings.append(_finding(
+                "Image", "Medium", "REVIEW",
+                "Image-editing software tag inside an embedded image",
+                f"An embedded graphic ({im['w']}x{im['h']}) in this Office file carries the "
+                f"editing-software tag '{soft}' in its EXIF metadata. A scanned or "
+                f"camera-original graphic would not normally record an image editor.",
+                evidence=f"EXIF Software={soft} ({im['name']})", image_png=im.get("_png")))
+    try:
+        # visible document text (from the OOXML) as the entity reference for OCR
+        native = " ".join(re.findall(r"<[wa]:t[^>]*>([^<]+)</[wa]:t>",
+                                     blobs.get("word/document.xml", "") +
+                                     blobs.get("ppt/presentation.xml", ""))) or \
+                 blobs.get("xl/sharedStrings.xml", "")
+        ocr_findings, ocr_texts = layer_ocr(
+            imgs, native, lambda im: Image.open(io.BytesIO(im["_png"])))
+        findings.extend(ocr_findings)
+    except Exception:
+        pass
+
     cdate = created
     summary = {
         "file": filename,
@@ -1194,16 +1534,45 @@ def analyze_office(path, filename=None):
         "last_modified_by": last_by, "revision": revision,
         "editing_minutes": total_time,
     }
-    return {"summary": summary, "findings": findings, "_images": [],
-            "_created_dt": cdate, "_producer": application, "_author": creator}
+    return {"summary": summary, "findings": findings, "_images": imgs,
+            "_created_dt": cdate, "_producer": application, "_author": creator,
+            "_ocr_texts": ocr_texts}
+
+
+def _unreadable_result(path, filename, ext, err):
+    """A safe result for a file that could not be opened/parsed, so one bad upload
+    never crashes the whole batch or the app."""
+    try:
+        data = open(path, "rb").read()
+        sha, size = hashlib.sha256(data).hexdigest(), len(data)
+    except Exception:
+        sha, size = "", 0
+    kind = (ext.lstrip(".") or "document").upper()
+    finding = _finding(
+        "File", "High", "REVIEW", "File could not be analysed",
+        f"This file could not be opened or parsed as a valid {kind} "
+        f"({type(err).__name__}). It may be corrupt, password-protected/encrypted, or not "
+        f"actually a {kind} despite its name. A file that won't open cleanly is itself worth "
+        f"questioning — ask the sender for a clean copy.",
+        evidence=f"{type(err).__name__}: {str(err)[:140]}")
+    summary = {"file": filename, "pages": "-", "producer": "-", "creator": "", "author": "",
+               "title": "", "created": "", "sha256": sha, "size": size,
+               "analyzed_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    return {"summary": summary, "findings": [finding], "_images": [],
+            "_created_dt": None, "_producer": "", "_author": "", "_ocr_texts": {}}
 
 
 def analyze_file(path, filename=None):
-    """Dispatch to the right analyser by file type (PDF vs Office)."""
-    ext = os.path.splitext(filename or path)[1].lower()
-    if ext in (".docx", ".xlsx", ".pptx", ".docm", ".xlsm", ".pptm"):
-        return analyze_office(path, filename)
-    return analyze_document(path, filename)
+    """Dispatch to the right analyser by file type (PDF vs Office). Never raises:
+    an unreadable file returns a graceful 'could not analyse' result instead."""
+    filename = filename or os.path.basename(path)
+    ext = os.path.splitext(filename)[1].lower()
+    try:
+        if ext in (".docx", ".xlsx", ".pptx", ".docm", ".xlsm", ".pptm"):
+            return analyze_office(path, filename)
+        return analyze_document(path, filename)
+    except Exception as err:
+        return _unreadable_result(path, filename, ext, err)
 
 
 # ---------------------------------------------------------------------------
@@ -1212,7 +1581,6 @@ def analyze_file(path, filename=None):
 def correlate_documents(results):
     """results: dict filename -> analyze_document() output. Returns list of findings."""
     findings = []
-    names = list(results.keys())
 
     # exact image reuse across files
     by_sha = defaultdict(list)
@@ -1344,11 +1712,24 @@ PLAIN_LANGUAGE = {
         "first written (and possibly after it was 'finalised' or signed).",
         "Look at exactly what changed - a date, an amount, a name. Editing after finalising or "
         "signing is the classic tampering pattern; confirm the change was legitimate."),
+    "File could not be analysed": (
+        "This file wouldn't open properly",
+        "The file could not be opened or read as a valid document. It may be corrupt, "
+        "password-protected, or not actually the type of file its name claims.",
+        "Ask the sender for a clean, openable copy. A document that won't open cleanly is "
+        "itself worth questioning."),
     "Data after end-of-file marker": (
         "Extra hidden data is attached after the document's end",
         "There are extra bytes tacked on after the point where the PDF is supposed to end. "
         "This can be harmless leftover data, or it can be a second file hidden inside this one.",
         "Have someone inspect the trailing bytes to confirm whether anything is hidden there."),
+    "Signature block appears unsigned": (
+        "A party hasn't signed the document",
+        "One of the named signatories has an empty signature block - no signature and no date "
+        "filled in - while another party has signed. A contract executed by only some of its "
+        "parties may not be legally binding, and an underwriter checks this first.",
+        "Confirm whether a fully-executed copy exists. If this is the only version, the "
+        "document is not fully signed and should not be relied on as a binding agreement."),
     "Digital signature is broken (content changed after signing)": (
         "The digital signature is broken - the file was changed after signing",
         "This document carries a real cryptographic signature, and it no longer matches the "
@@ -1569,6 +1950,36 @@ PLAIN_LANGUAGE = {
         "is included so you can still eyeball it.",
         "No action needed unless a bright patch lines up with important text; then obtain the "
         "original page to compare."),
+    "Signature/stamp read — name matches the document": (
+        "We read the signature/stamp and the company name checks out",
+        "We used OCR to read the text printed inside a signature or stamp on the page. The "
+        "company/party name on it does appear in the document, so the stamp is consistent with "
+        "who the document is meant to be from. This is a positive check, shown so you can see "
+        "the stamp was read and verified.",
+        "No action needed on the name itself. If the same stamp is reused across several "
+        "'separately signed' documents, still confirm each use was authorised."),
+    "Signature/stamp read — confirm the name": (
+        "We read the signature/stamp — please confirm the company name",
+        "We used OCR to read the text inside a signature or stamp on the page, but couldn't "
+        "automatically match a company/party name on it to the document's own text. That may "
+        "just be OCR noise, or the stamp may name a different party.",
+        "Read the stamp text shown and confirm the company on it is the party this document is "
+        "meant to be from."),
+    "A logo or stamp names a company not in the document": (
+        "A stamp/logo names a company the document never mentions",
+        "We read the text printed inside a stamp or logo on the page (using OCR) and it names a "
+        "company that appears nowhere in the document's own wording. A mark for a different "
+        "company than the one the document is about is a strong sign of a reused or rebranded "
+        "template - and unlike the metadata hints, this is visible right on the page.",
+        "Look at the stamp/logo named and confirm which company it really belongs to and why "
+        "it is on this document."),
+    "Text read from a scanned page (OCR)": (
+        "We read the text off a scanned page",
+        "One page is a picture (a scan), not real text, so we used OCR to read what it says - "
+        "this makes its figures and names available for checking against the rest of the pack. "
+        "OCR can misread the odd character, so treat exact numbers as read-with-care.",
+        "Compare the figures and names read from the scan against the same items elsewhere in "
+        "the document set; get the original page if anything looks off."),
     "Multiple distinct logos / letterheads in one document": (
         "The document uses more than one logo / letterhead",
         "The pages don't all carry the same logo. A document produced from a single source "
@@ -1608,22 +2019,33 @@ def humanize(finding):
     }
 
 
-def _files_in_cross(f):
-    """Best-effort list of filenames a cross-document finding refers to."""
-    ev = f.get("evidence") or ""
-    # evidence forms: "dist 14: A.pdf p1 <-> B.pdf p3"  |  "A.pdf p1; B.pdf p2"
-    parts = re.split(r"<->|;", ev.split(":", 1)[-1])
-    files = []
-    for p in parts:
-        p = p.strip()
-        m = re.match(r"(.+?\.pdf)", p, re.I)
-        if m:
-            files.append(m.group(1).strip())
-    return files
+# Definitive, non-hedged statements for the findings that are reproducible FACTS
+# (status == CONFIRMED). These are stated flatly — no "possibly/consistent with".
+FACT_STATEMENTS = {
+    "Incremental updates present":
+        "was edited and re-saved after its first save — an earlier version is still inside it.",
+    "Content changed between saved revisions":
+        "had text changed between saved versions — content was edited after an earlier save.",
+    "Leftover template placeholder":
+        "still contains an unfilled template placeholder next to a value that should be typed in.",
+    "Multiple template vintages":
+        "carries several different fixed template dates at once, so parts came from different "
+        "template versions.",
+    "Identical image reused across files":
+        "shares a byte-for-byte identical image with other documents in the set.",
+    "Reused signature/stamp/graphic across files":
+        "The same signature/stamp image appears on multiple documents — it is one reused image, "
+        "not independent signatures.",
+    "Redaction not applied (text recoverable)":
+        "has a redaction whose text was never removed — it is still in the file and readable.",
+    "Digital signature is broken (content changed after signing)":
+        "The cryptographic signature does not match the content — the file was changed after "
+        "it was signed.",
+}
 
 
 def build_executive_summary(results, cross):
-    """Plain-English overview: a headline, narrative points, and next steps.
+    """Plain-English overview: a headline, definitive facts, narrative points, next steps.
 
     Returns a dict the UI and exporters render however they like.
     """
@@ -1632,23 +2054,39 @@ def build_executive_summary(results, cross):
     n_high = sum(1 for f in all_ff if f["severity"] == "High")
     n_confirmed = sum(1 for f in all_ff if f["status"] == "CONFIRMED")
 
+    # Established facts: the CONFIRMED findings, stated flatly (definitive tier).
+    established_facts, seen_fact = [], set()
+    for fn, r in results.items():
+        for f in r["findings"]:
+            if f["status"] != "CONFIRMED":
+                continue
+            if f["title"] == "Internal name reveals a different company":
+                m = re.search(r"Foreign name '([^']+)'", f.get("evidence", ""))
+                nm = m.group(1) if m else "another company"
+                sentence = (f"{fn} has the name '{nm}' — a different company — embedded in its "
+                            f"own internal metadata (not its visible brand).")
+            elif f["title"] in FACT_STATEMENTS:
+                stmt = FACT_STATEMENTS[f["title"]]
+                sentence = (stmt if stmt[0].isupper() else f"{fn} {stmt}")
+            else:
+                continue
+            if sentence not in seen_fact:
+                seen_fact.add(sentence)
+                established_facts.append(sentence)
+    for f in cross:
+        if f["status"] == "CONFIRMED" and f["title"] in FACT_STATEMENTS:
+            stmt = FACT_STATEMENTS[f["title"]]
+            if stmt not in seen_fact:
+                seen_fact.add(stmt)
+                established_facts.append(stmt)
+
     def has(t):
         return t in titles
 
     themes = []
 
-    # 1. Reused signatures / identical images across files (strongest signal)
-    reuse = [f for f in cross if f["title"] in (
-        "Reused signature/stamp/graphic across files", "Identical image reused across files")]
-    if reuse:
-        files = set()
-        for f in reuse:
-            files.update(_files_in_cross(f))
-        n = len(files) if files else len(reuse) + 1
-        themes.append(
-            f"The same signature or stamp image was reused across {n} of the documents that "
-            f"are each presented as separately signed. A genuine signature differs every time, "
-            f"so these should be treated as one reused image, not as independent signatures.")
+    # (Reused signatures / identical images are CONFIRMED facts — they appear in the
+    #  "Established facts" tier above, so they are deliberately NOT repeated here.)
 
     # 2. Single-session re-export from different sources
     if has("Files re-exported in one session from different sources"):
@@ -1657,32 +2095,19 @@ def build_executive_summary(results, cross):
             "but name different authors - consistent with re-prints assembled from several "
             "source files, rather than independent originals.")
 
-    # 3. Edited-after-save (incremental updates)
-    edited = [(fn, r) for fn, r in results.items()
-              if any(f["title"] == "Incremental updates present" for f in r["findings"])]
-    if edited:
-        names = ", ".join(fn for fn, _ in edited)
-        themes.append(
-            f"{names} was edited and re-saved after its first save, and the earlier version is "
-            f"still inside the file. It should be reconstructed to see what changed.")
+    # (Edited-after-save / incremental updates is a CONFIRMED fact — shown in the
+    #  "Established facts" tier above, not repeated here.)
 
-    # 4. Provenance / rebrand — the serious case: a foreign company in the internal name
-    prov = [fn for fn, r in results.items()
-            if any(f["title"] == "Internal name reveals a different company"
-                   for f in r["findings"])]
-    if prov:
-        verb = "carry" if len(prov) > 1 else "carries"
-        themes.append(
-            f"{', '.join(prov)} {verb} a *different company's name* hidden inside the file "
-            f"(internal metadata), which doesn't match the document's own branding — a classic "
-            f"sign of a rebranded template. This is a strong lead worth explaining.")
+    # (A different company embedded in the internal name is now a CONFIRMED fact,
+    #  shown in the "Established facts" tier above — not repeated here.)
 
-    # 5. Overlaid values / leftover placeholders
-    if has("Leftover template placeholder") or has("Overlaid / inserted text"):
+    # 5. Overlaid values (judgment). The leftover placeholder itself is a CONFIRMED
+    #    fact shown above; the "value looks dropped-on" reading is the judgment part.
+    if has("Overlaid / inserted text"):
         themes.append(
-            "At least one document has a template placeholder left in it and/or a value that "
-            "looks dropped onto the page rather than typed in - a sign a field was filled by "
-            "overlay.")
+            "At least one document has a value that looks dropped onto the page rather than "
+            "typed in - a possible sign a field was filled by overlay rather than genuinely "
+            "entered.")
 
     # 6. Fake redaction
     if has("Possible fake redaction"):
@@ -1700,11 +2125,8 @@ def build_executive_summary(results, cross):
             f"which suggests it was assembled from more than one source or template (or a "
             f"rebrand left an older brand's logo behind). The logos are shown in the report.")
 
-    # 7. Multiple template vintages
-    if has("Multiple template vintages"):
-        themes.append(
-            "At least one document mixes several template dates, suggesting it was stitched "
-            "together from templates of different vintages.")
+    # (Multiple template vintages is a CONFIRMED fact — shown in the "Established
+    #  facts" tier above, not repeated here.)
 
     # 8. Scanned / re-generated copy
     scanned = [fn for fn, r in results.items()
@@ -1717,7 +2139,11 @@ def build_executive_summary(results, cross):
             f"issuing authority.")
 
     # Headline
-    if n_high:
+    if established_facts:
+        headline = (f"This analysis establishes {len(established_facts)} definitive, reproducible "
+                    f"fact(s) about these documents (listed first below), alongside further "
+                    f"anomalies that require human judgment.")
+    elif n_high:
         headline = ("Several findings need your attention before these documents can be relied "
                     "on.")
     elif any(f["severity"] == "Medium" for f in all_ff):
@@ -1746,6 +2172,7 @@ def build_executive_summary(results, cross):
         "n_high": n_high,
         "n_confirmed": n_confirmed,
         "headline": headline,
+        "established_facts": established_facts,
         "themes": themes,
         "actions": actions,
     }
