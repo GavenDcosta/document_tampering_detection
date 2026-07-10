@@ -23,20 +23,24 @@ I have analyzed a document and found the following anomalies and flags:
    - Explicitly execute searches like: `"MagnetTx" "Akesis" partnership` and `"MagnetTx" "Akesis" alliance`.
 3. Ignore purely offline/internal recommendations like "Ask for the original Word document" or "Check for text overlay." Focus ONLY on what can be searched on the web.
 
-You MUST format your response exactly like this:
-### 1. Individuals
-- **[Name]**: [Findings regarding this person and all companies. Was there a match?]
-
-### 2. Companies & Relationships
-- **[Company Name]**: [Findings regarding partnerships or connections]
-
-### 3. Conclusion
-- [Brief summary of whether these findings explain the anomalies or if they remain suspicious]
-
-### 4. Sources (MANDATORY)
-- [URL 1] - [What this link proves]
-- [URL 2] - [What this link proves]
-- (You MUST provide the exact URLs you found in your Google Search. Do not skip this section.)
+You MUST output your response in strict, valid JSON format exactly matching the following structure. Do NOT wrap it in markdown ticks (```json):
+{{
+  "individuals": [
+    {{
+      "name": "Person Name",
+      "findings": "Findings regarding this person and all companies. Was there a match?",
+      "sources": ["URL 1", "URL 2"]
+    }}
+  ],
+  "companies": [
+    {{
+      "name": "Company Name",
+      "findings": "Findings regarding partnerships or connections",
+      "sources": ["URL 1", "URL 2"]
+    }}
+  ],
+  "conclusion": "Brief summary of whether these findings explain the anomalies or if they remain suspicious"
+}}
 """
         
         response = client.models.generate_content(

@@ -874,11 +874,94 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix", ai
         draw_section_header("AI Web Verification Results")
         if pdf.get_y() > 240:
             pdf.add_page()
-        pdf.set_font("helvetica", "", 9)
-        pdf.set_text_color(*TEXT_PRIMARY)
-        ai_text = clean(ai_report)
-        pdf.multi_cell(0, 5, ai_text, markdown=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.ln(2)
+            
+        try:
+            import json
+            raw_json = ai_report.strip()
+            if raw_json.startswith("```"):
+                raw_json = raw_json.split("\n", 1)[-1]
+                if raw_json.endswith("```"):
+                    raw_json = raw_json[:-3].strip()
+            report_data = json.loads(raw_json)
+            
+            def draw_ai_table(title, items):
+                if not items: return
+                pdf.set_font("helvetica", "B", 8.5)
+                pdf.set_text_color(*BRAND_DARK)
+                pdf.cell(0, 6, title, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                
+                # Header
+                col_w = [40, 90, 60]
+                pdf.set_font("helvetica", "B", 7)
+                pdf.set_text_color(255, 255, 255)
+                pdf.set_fill_color(*BRAND_DARK)
+                pdf.cell(col_w[0], 6, "Name", border=1, fill=True)
+                pdf.cell(col_w[1], 6, "Findings", border=1, fill=True)
+                pdf.cell(col_w[2], 6, "Sources", border=1, fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                
+                pdf.set_font("helvetica", "", 7)
+                pdf.set_text_color(*TEXT_PRIMARY)
+                fill = False
+                for item in items:
+                    if fill:
+                        pdf.set_fill_color(250, 250, 250)
+                    else:
+                        pdf.set_fill_color(255, 255, 255)
+                        
+                    name = clean(item.get("name", ""))
+                    findings = clean(item.get("findings", ""))
+                    sources = item.get("sources", [])
+                    src_str = clean(", ".join(sources)) if isinstance(sources, list) else clean(str(sources))
+                    
+                    start_y = pdf.get_y()
+                    if start_y > 260:
+                        pdf.add_page()
+                        start_y = pdf.get_y()
+                        
+                    # Calculate height needed
+                    pdf.set_xy(pdf.l_margin + col_w[0], start_y + 1)
+                    pdf.multi_cell(col_w[1], 4, findings, border=0)
+                    end_y1 = pdf.get_y()
+                    
+                    pdf.set_xy(pdf.l_margin + col_w[0] + col_w[1], start_y + 1)
+                    pdf.multi_cell(col_w[2], 4, src_str, border=0)
+                    end_y2 = pdf.get_y()
+                    
+                    h = max(end_y1 - start_y, end_y2 - start_y, 6)
+                    
+                    # Draw borders and name
+                    pdf.set_xy(pdf.l_margin, start_y)
+                    pdf.cell(col_w[0], h, name, border=1, fill=fill)
+                    pdf.rect(pdf.l_margin + col_w[0], start_y, col_w[1], h, "DF" if fill else "D")
+                    pdf.rect(pdf.l_margin + col_w[0] + col_w[1], start_y, col_w[2], h, "DF" if fill else "D")
+                    
+                    # Redraw text
+                    pdf.set_xy(pdf.l_margin + col_w[0], start_y + 1)
+                    pdf.multi_cell(col_w[1], 4, findings, border=0)
+                    pdf.set_xy(pdf.l_margin + col_w[0] + col_w[1], start_y + 1)
+                    pdf.multi_cell(col_w[2], 4, src_str, border=0)
+                    
+                    pdf.set_y(start_y + h)
+                    fill = not fill
+                pdf.ln(3)
+
+            draw_ai_table("Individuals", report_data.get("individuals", []))
+            draw_ai_table("Companies", report_data.get("companies", []))
+            
+            pdf.set_font("helvetica", "B", 8.5)
+            pdf.set_text_color(*BRAND_DARK)
+            pdf.cell(0, 6, "Conclusion", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font("helvetica", "", 8)
+            pdf.set_text_color(*TEXT_PRIMARY)
+            pdf.multi_cell(0, 5, clean(report_data.get("conclusion", "")), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.ln(2)
+            
+        except Exception:
+            pdf.set_font("helvetica", "", 9)
+            pdf.set_text_color(*TEXT_PRIMARY)
+            ai_text = clean(ai_report)
+            pdf.multi_cell(0, 5, ai_text, markdown=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.ln(2)
 
     return bytes(pdf.output())
 
@@ -1096,7 +1179,38 @@ else:
 
 if "ai_report" in st.session_state:
     st.markdown("### AI Verification Results")
-    st.markdown(st.session_state["ai_report"])
+    try:
+        import json
+        import pandas as pd
+        raw_json = st.session_state["ai_report"].strip()
+        if raw_json.startswith("```"):
+            raw_json = raw_json.split("\n", 1)[-1]
+            if raw_json.endswith("```"):
+                raw_json = raw_json[:-3].strip()
+        report_data = json.loads(raw_json)
+        
+        st.markdown("#### Verification of Individuals")
+        if report_data.get("individuals"):
+            df_ind = pd.DataFrame(report_data["individuals"])
+            if "sources" in df_ind.columns:
+                df_ind["sources"] = df_ind["sources"].apply(lambda x: ", ".join(x) if isinstance(x, list) else x)
+            st.table(df_ind)
+        else:
+            st.info("No individuals verified.")
+            
+        st.markdown("#### Verification of Companies")
+        if report_data.get("companies"):
+            df_comp = pd.DataFrame(report_data["companies"])
+            if "sources" in df_comp.columns:
+                df_comp["sources"] = df_comp["sources"].apply(lambda x: ", ".join(x) if isinstance(x, list) else x)
+            st.table(df_comp)
+        else:
+            st.info("No companies verified.")
+            
+        st.markdown("#### Conclusion")
+        st.success(report_data.get("conclusion", ""))
+    except Exception as e:
+        st.markdown(st.session_state["ai_report"])
     if st.button("🔄 Force Re-run AI Verification"):
         if "ai_report_hash" in st.session_state:
             del st.session_state["ai_report_hash"]
