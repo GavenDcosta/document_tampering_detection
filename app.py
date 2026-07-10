@@ -64,9 +64,15 @@ def chip(text, bg, fg="#fff"):
     return f'<span class="chip" style="background:{bg};color:{fg}">{text}</span>'
 
 
+# Bump this whenever the engine's output shape changes, so cached analyses from an
+# older code version are invalidated instead of silently reused (e.g. findings that
+# predate image evidence). It is part of the cache key below.
+ANALYSIS_VERSION = "2025-07-10-image-evidence"
+
+
 @st.cache_data(show_spinner=False)
-def run_analysis(file_sigs):
-    """file_sigs: tuple of (name, sha, path). Cached by content so filtering is instant."""
+def run_analysis(file_sigs, version=ANALYSIS_VERSION):
+    """file_sigs: tuple of (name, sha, path). Cached by content + engine version."""
     results = {}
     for name, _sha, path in file_sigs:
         results[name] = fe.analyze_document(path, name)
@@ -770,7 +776,7 @@ if not uploaded:
 
 sigs, paths = persist(uploaded)
 with st.spinner("Analysing…"):
-    results, cross = run_analysis(sigs)
+    results, cross = run_analysis(sigs, ANALYSIS_VERSION)
 
 # ---- summary metrics ----
 rows = all_findings_rows(results, cross)
@@ -870,7 +876,8 @@ st.subheader("Per-file detail")
 for fn, r in results.items():
     s = r["summary"]
     n = len(r["findings"])
-    with st.expander(f"📄 {fn} — {n} finding{'s' if n != 1 else ''} · {s['pages']} pages"):
+    with st.expander(f"📄 {fn} — {n} finding{'s' if n != 1 else ''} · {s['pages']} pages",
+                     expanded=(len(results) == 1)):
         st.info(fe.document_verdict(fn, r, cross))
         st.markdown(
             f'<div class="meta">Producer: {s["producer"] or "—"}<br>'

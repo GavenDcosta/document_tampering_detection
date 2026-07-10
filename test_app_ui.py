@@ -40,5 +40,13 @@ spec.loader.exec_module(app)   # should run to completion with no exception
 assert hasattr(app, "results") and len(app.results) == 4, "results not populated"
 assert hasattr(app, "summary") and app.summary["n_files"] == 4
 assert app.pdf_bytes[:4] == b"%PDF" and len(app.md) > 1000
-print(f"App analysed {len(app.results)} files; summary headline: {app.summary['headline']!r}")
+
+# the image findings must have actually driven st.image(...) with real PNG bytes
+img_calls = st.image.call_args_list
+assert len(img_calls) > 0, "st.image was never called - no image evidence rendered"
+first_arg = img_calls[0].args[0]
+assert isinstance(first_arg, (bytes, bytearray)) and first_arg[:4] in (b"\x89PNG",), \
+    f"st.image did not receive PNG bytes: {type(first_arg)}"
+print(f"App analysed {len(app.results)} files; st.image called {len(img_calls)} times with real PNG bytes")
+print(f"summary headline: {app.summary['headline']!r}")
 print("APP RAN END-TO-END WITH NO EXCEPTIONS")
