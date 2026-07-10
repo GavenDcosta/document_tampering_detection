@@ -1152,6 +1152,7 @@ for title, desc in fe.MANUAL_CHECKLIST:
     st.checkbox(f"{title} — {desc}", key=f"mc_{title}")
 
 # ---- AI Web Verification ----
+'''
 st.subheader("AI Web Verification")
 st.caption("Uses Gemini 2.5 Flash and Google Search to verify entities (companies, names) found in the document anomalies.")
 api_key = st.secrets.get("GOOGLE_API_KEY")
@@ -1215,6 +1216,7 @@ if "ai_report" in st.session_state:
         if "ai_report_hash" in st.session_state:
             del st.session_state["ai_report_hash"]
         st.rerun()
+'''
 
 # ---- downloads ----
 st.subheader("Export report")
@@ -1245,7 +1247,7 @@ json_blob = json.dumps(
     {fn: {"summary": r["summary"], "findings": _json_findings(r["findings"])}
      for fn, r in results.items()}
     | {"_cross_document": _json_findings(cross)}, indent=2, default=str)
-pdf_bytes = build_pdf_report(results, cross, paths=paths, ai_report=st.session_state.get("ai_report"))
+pdf_bytes = build_pdf_report(results, cross, paths=paths, ai_report=None)
 
 d1.download_button("Download PDF report", pdf_bytes, file_name=f"{base}.pdf",
                    mime="application/pdf", use_container_width=True)
