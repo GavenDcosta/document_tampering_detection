@@ -105,57 +105,178 @@ def all_findings_rows(results, cross):
 
 
 def render_card(f):
+    """Plain-language finding card. The technical detail/evidence lives in an
+    expander so a non-technical reader sees the meaning first."""
     sev = f["severity"]; color = SEV_COLOR.get(sev, "#999")
+    h = fe.humanize(f)
     loc = []
     if f.get("page"):
         loc.append(f"page {f['page']}")
     if f.get("section"):
         loc.append(f"§{f['section']}")
     loc = f'<span style="color:#6b7280;font-size:.82rem;"> · {" · ".join(loc)}</span>' if loc else ""
-    ev = f'<div class="ev">{f["evidence"]}</div>' if f.get("evidence") else ""
     st.markdown(
         f'<div class="card" style="border-left-color:{color}">'
-        f'{chip(sev, color)}{chip(f["status"], "#fff", SEV_COLOR["Info"])}'
-        f'<span class="t">{f["title"]}</span>{loc}'
-        f'<div class="d">{f["detail"]}</div>{ev}</div>', unsafe_allow_html=True)
+        f'{chip(h["severity_label"], color)}{chip(h["status_label"], "#fff", SEV_COLOR["Info"])}'
+        f'<span class="t">{h["headline"]}</span>{loc}'
+        f'<div class="d"><b>What it means:</b> {h["means"]}</div>'
+        f'<div class="d"><b>What to do:</b> {h["action"]}</div></div>',
+        unsafe_allow_html=True)
+    with st.expander("Technical detail"):
+        st.markdown(f"**{f['title']}**  ·  _{f['layer']} layer · {sev} · {f['status']}_")
+        st.write(f["detail"])
+        if f.get("evidence"):
+            st.code(f["evidence"], language=None)
 
 
 def build_markdown(results, cross):
     L = ["# Document Forensics Report",
          f"_Generated {datetime.datetime.now():%Y-%m-%d %H:%M} · offline analysis · "
          f"anomalies surfaced for human review, not proof of fraud._\n"]
-    # cross first
+
+    # ---- plain-English executive summary ----
+    summary = fe.build_executive_summary(results, cross)
+    L.append("## In plain English\n")
+    L.append(f"**{summary['headline']}**\n")
+    if summary["themes"]:
+        L.append("**What we found**\n")
+        for t in summary["themes"]:
+            L.append(f"- {t}")
+        L.append("")
+    if summary["actions"]:
+        L.append("**What to do next**\n")
+        for a in summary["actions"]:
+            L.append(f"- {a}")
+        L.append("")
+    L.append("_A flag is a question, not a verdict. These are anomalies for a human to "
+             "weigh, not proof of fraud or intent._\n")
+
+    # ---- one-line verdict per document ----
+    L.append("## Document-by-document\n")
+    for fn, r in results.items():
+        L.append(f"- **{fn}** — {fe.document_verdict(fn, r, cross)}")
+    L.append("")
+
+    # ---- detailed findings (plain language, technical detail kept as a note) ----
+    def render_finding(f):
+        h = fe.humanize(f)
+        loc = (f" (page {f['page']}" + (f", §{f['section']}" if f.get("section") else "") + ")") \
+            if f.get("page") else ""
+        L.append(f"- **[{h['severity_label']}] {h['headline']}**{loc}")
+        L.append(f"    - *What it means:* {h['means']}")
+        L.append(f"    - *What to do:* {h['action']}")
+        L.append(f"    - *Technical detail:* {f['detail']}"
+                 f"{'  `'+f['evidence']+'`' if f.get('evidence') else ''}")
+
     if cross:
-        L.append("## Cross-document findings\n")
+        L.append("## Findings across documents\n")
         for f in cross:
-            L.append(f"- **[{f['severity']}/{f['status']}] {f['title']}** — {f['detail']}"
-                     f"{'  `'+f['evidence']+'`' if f.get('evidence') else ''}")
+            render_finding(f)
         L.append("")
     for fn, r in results.items():
         s = r["summary"]
         L.append(f"## {fn}")
+        L.append(f"_{fe.document_verdict(fn, r, cross)}_\n")
         L.append(f"- Pages: {s['pages']} · SHA256: `{s['sha256']}`")
-        L.append(f"- Producer: {s['producer'] or '—'} · Author: {s['author'] or '—'} · "
-                 f"Created: {s['created'] or '—'}")
+        L.append(f"- Producer: {s['producer'] or '-'} · Author: {s['author'] or '-'} · "
+                 f"Created: {s['created'] or '-'}")
         if s.get("title"):
             L.append(f"- Internal title: `{s['title']}`")
         L.append("")
+        if not r["findings"]:
+            L.append("- No automated flags on this file.\n")
+            continue
         for f in sorted(r["findings"], key=lambda x: ["High","Medium","Low","Info"].index(x["severity"])):
-            loc = (f" (page {f['page']}" + (f", §{f['section']}" if f.get("section") else "") + ")") \
-                if f.get("page") else ""
-            L.append(f"- **[{f['severity']}/{f['status']}] {f['title']}**{loc} — {f['detail']}"
-                     f"{'  `'+f['evidence']+'`' if f.get('evidence') else ''}")
+            render_finding(f)
         L.append("")
     L.append("## Manual verification checklist")
+    L.append("_What this tool cannot confirm on its own — work through these to close the case._\n")
     for title, desc in fe.MANUAL_CHECKLIST:
         L.append(f"- [ ] **{title}** — {desc}")
     return "\n".join(L)
 
 
-def build_pdf_report(results, cross, brand_name="Transformatrix"):
+def _collect_signature_crops(results, cross, paths):
+    """Return [(label, png_bytes, w_px, h_px)] for the reused signature/stamp graphics."""
+    reuse = [f for f in cross if f["title"] in (
+        "Reused signature/stamp/graphic across files", "Identical image reused across files")]
+    crops, seen = [], set()
+    for f in reuse:
+        ev = f.get("evidence") or ""
+        try:
+            body = ev.split(":", 1)[1]
+            sides = [x.strip() for x in body.split("<->")]
+        except Exception:
+            continue
+        for side in sides:
+            fname = side.rsplit(" p", 1)[0].strip()
+            try:
+                pageno = int(side.rsplit(" p", 1)[1].split()[0])
+            except Exception:
+                continue
+            key = (fname, pageno)
+            if key in seen:
+                continue
+            path = paths.get(fname)
+            if not path or fname not in results:
+                continue
+            imgs = sorted((im for im in results[fname]["_images"] if im["page"] == pageno),
+                          key=lambda x: -(x["w"] * x["h"]))
+            for im in imgs:
+                if im["coverage"] < 0.6:
+                    try:
+                        png = fe.get_image_png(path, im["xref"])
+                        crops.append((f"{fname} p{pageno}", png, im["w"], im["h"]))
+                        seen.add(key)
+                    except Exception:
+                        pass
+                    break
+    return crops
+
+
+def draw_signature_crops(pdf, results, cross, paths, clean, page_w,
+                         draw_section_header, BRAND_DARK, TEXT_SECONDARY):
+    """Embed side-by-side crops of the reused signature/stamp images (#12)."""
+    crops = _collect_signature_crops(results, cross, paths)
+    if not crops:
+        return
+    draw_section_header("Reused signature / stamp - visual evidence")
+    pdf.set_font("helvetica", "I", 8)
+    pdf.set_text_color(*TEXT_SECONDARY)
+    pdf.multi_cell(w=page_w, h=4.5, text=clean(
+        "The same graphic appears across these documents. A genuine signature differs every "
+        "time; an identical one was applied as an image. Confirm authorisation per document."))
+    pdf.ln(2)
+
+    cols = 3
+    col_w = page_w / cols
+    img_w = col_w - 6
+    for row_start in range(0, len(crops), cols):
+        row = crops[row_start:row_start + cols]
+        heights = [min(img_w * (h / w) if w else 20, 40) for _, _, w, h in row]
+        row_h = max(heights) + 8
+        if pdf.get_y() + row_h > 270:
+            pdf.add_page()
+        y0 = pdf.get_y()
+        for i, (label, png, w_px, h_px) in enumerate(row):
+            x = pdf.l_margin + i * col_w
+            try:
+                pdf.image(io.BytesIO(png), x=x + 3, y=y0 + 2, w=img_w, h=heights[i])
+            except Exception:
+                pass
+            pdf.set_xy(x + 3, y0 + heights[i] + 3)
+            pdf.set_font("helvetica", "", 7)
+            pdf.set_text_color(*BRAND_DARK)
+            pdf.cell(img_w, 4, clean(label)[:40])
+        pdf.set_y(y0 + row_h)
+    pdf.ln(1)
+
+
+def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix"):
     from fpdf import FPDF
     from fpdf.enums import XPos, YPos
     import datetime
+    paths = paths or {}
 
     # -- Color palette --
     BRAND_DARK = (15, 23, 42)       # slate-900
@@ -172,10 +293,20 @@ def build_pdf_report(results, cross, brand_name="Transformatrix"):
         "Info": (107, 114, 128),    # gray-500
     }
 
+    # Map common unicode punctuation to ASCII so the core PDF fonts (latin-1) don't
+    # render em-dashes / smart quotes as "?".
+    UNI = {"—": "-", "–": "-", "‒": "-", "−": "-",
+           "‘": "'", "’": "'", "“": '"', "”": '"',
+           "…": "...", " ": " ", "→": "->", "•": "-",
+           "·": "-", "§": "sec ", "×": "x"}
+
     def clean(txt):
         if not txt:
             return ""
-        t = str(txt).encode("latin-1", "replace").decode("latin-1")
+        t = str(txt)
+        for u, a in UNI.items():
+            t = t.replace(u, a)
+        t = t.encode("latin-1", "replace").decode("latin-1")
         out = []
         for word in t.split():
             while len(word) > 50:
@@ -265,26 +396,23 @@ def build_pdf_report(results, cross, brand_name="Transformatrix"):
         return w1 + w2 + 4
 
     def draw_finding_card(f):
+        h = fe.humanize(f)
         start_y = pdf.get_y()
         page_w = pdf.w - pdf.l_margin - pdf.r_margin
         card_x = pdf.l_margin
         color = SEV.get(f["severity"], (128, 128, 128))
 
         # Reserve space - check if we need a new page
-        if pdf.get_y() > 250:
+        if pdf.get_y() > 245:
             pdf.add_page()
             start_y = pdf.get_y()
-
-        # Card background
-        pdf.set_fill_color(*CARD_BG)
-        # We'll draw the bg after measuring height
 
         content_x = card_x + 5
         pdf.set_x(content_x)
         badge_y = start_y + 3
 
-        # Badges
-        draw_severity_badge(f["severity"], f["status"], content_x, badge_y)
+        # Badges (plain-language labels)
+        draw_severity_badge(h["severity_label"], h["status_label"], content_x, badge_y)
 
         # Location tag
         loc = ""
@@ -293,40 +421,57 @@ def build_pdf_report(results, cross, brand_name="Transformatrix"):
             if f.get("section"):
                 loc += f" | sec {f['section']}"
         if loc:
-            pdf.set_xy(content_x + 50, badge_y)
+            pdf.set_xy(content_x + 62, badge_y)
             pdf.set_font("helvetica", "", 7)
             pdf.set_text_color(*TEXT_SECONDARY)
             pdf.cell(0, 5, loc, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-        # Title
+        # Headline (plain language)
         pdf.set_xy(content_x, badge_y + 7)
         pdf.set_font("helvetica", "B", 10)
         pdf.set_text_color(*TEXT_PRIMARY)
         try:
-            pdf.multi_cell(w=page_w - 8, h=5, text=clean(f["title"]))
+            pdf.multi_cell(w=page_w - 8, h=5, text=clean(h["headline"]))
         except Exception:
             pass
 
-        # Detail
+        # What it means
+        pdf.set_x(content_x)
+        pdf.set_font("helvetica", "B", 8)
+        pdf.set_text_color(*TEXT_SECONDARY)
+        pdf.cell(0, 4.5, "What it means", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_x(content_x)
         pdf.set_font("helvetica", "", 8.5)
-        pdf.set_text_color(*TEXT_SECONDARY)
+        pdf.set_text_color(*TEXT_PRIMARY)
         try:
-            pdf.multi_cell(w=page_w - 8, h=4.5, text=clean(f["detail"]))
+            pdf.multi_cell(w=page_w - 8, h=4.5, text=clean(h["means"]))
         except Exception:
             pass
 
-        # Evidence
+        # What to do
+        pdf.set_x(content_x)
+        pdf.set_font("helvetica", "B", 8)
+        pdf.set_text_color(*TEXT_SECONDARY)
+        pdf.cell(0, 4.5, "What to do", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_x(content_x)
+        pdf.set_font("helvetica", "", 8.5)
+        pdf.set_text_color(*TEXT_PRIMARY)
+        try:
+            pdf.multi_cell(w=page_w - 8, h=4.5, text=clean(h["action"]))
+        except Exception:
+            pass
+
+        # Technical detail (smaller, muted)
+        pdf.set_x(content_x)
+        pdf.set_font("helvetica", "I", 7.5)
+        pdf.set_text_color(*TEXT_SECONDARY)
+        tech = clean(f["detail"])
         if f.get("evidence"):
-            pdf.set_x(content_x)
-            pdf.set_fill_color(226, 232, 240)  # slate-200
-            ev_y = pdf.get_y() + 1
-            pdf.set_font("courier", "", 7.5)
-            pdf.set_text_color(71, 85, 105)  # slate-600
-            try:
-                pdf.multi_cell(w=page_w - 8, h=4, text=clean(f["evidence"])[:120])
-            except Exception:
-                pass
+            tech += "  [" + clean(f["evidence"])[:120] + "]"
+        try:
+            pdf.multi_cell(w=page_w - 8, h=4, text="Technical detail: " + tech)
+        except Exception:
+            pass
 
         end_y = pdf.get_y()
         card_h = end_y - start_y + 4
@@ -354,18 +499,21 @@ def build_pdf_report(results, cross, brand_name="Transformatrix"):
     pdf.ln(4)
 
     # -- Summary metrics --
-    total_findings = sum(len(r["findings"]) for r in results.values()) + len(cross)
-    high_count = sum(1 for r in results.values() for f in r["findings"] if f["severity"] == "High")
-    high_count += sum(1 for f in cross if f["severity"] == "High")
+    summ = fe.build_executive_summary(results, cross)
+    total_findings = summ["n_findings"]
+    high_count = summ["n_high"]
+    med_count = sum(1 for r in results.values() for f in r["findings"] if f["severity"] == "Medium")
+    med_count += sum(1 for f in cross if f["severity"] == "Medium")
+    page_w = pdf.w - pdf.l_margin - pdf.r_margin
 
     draw_section_header("Executive Summary")
     pdf.set_fill_color(*LIGHT_BG)
     box_y = pdf.get_y()
-    pdf.rect(pdf.l_margin, box_y, pdf.w - pdf.l_margin - pdf.r_margin, 12, "F")
-    box_w = (pdf.w - pdf.l_margin - pdf.r_margin) / 3
+    pdf.rect(pdf.l_margin, box_y, page_w, 12, "F")
+    box_w = page_w / 3
     for i, (label, val) in enumerate([("Files Analyzed", str(len(results))),
                                        ("Total Findings", str(total_findings)),
-                                       ("High Severity", str(high_count))]):
+                                       ("Need Attention", str(high_count))]):
         pdf.set_xy(pdf.l_margin + i * box_w + 3, box_y + 1)
         pdf.set_font("helvetica", "", 7)
         pdf.set_text_color(*TEXT_SECONDARY)
@@ -374,11 +522,72 @@ def build_pdf_report(results, cross, brand_name="Transformatrix"):
         pdf.set_font("helvetica", "B", 14)
         pdf.set_text_color(*BRAND_DARK)
         pdf.cell(box_w - 6, 6, val, new_x=XPos.LEFT, new_y=YPos.NEXT)
-    pdf.set_y(box_y + 14)
+    pdf.set_y(box_y + 16)
+
+    # -- Risk gauge (#12) --
+    if high_count > 0:
+        level_txt, level_col, frac = "Needs attention", SEV["High"], 0.86
+    elif med_count > 0:
+        level_txt, level_col, frac = "Some review needed", SEV["Medium"], 0.5
+    else:
+        level_txt, level_col, frac = "Low", (22, 163, 74), 0.16
+    pdf.set_font("helvetica", "B", 8)
+    pdf.set_text_color(*TEXT_SECONDARY)
+    pdf.cell(0, 4.5, f"Overall risk level: {level_txt}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    g_y = pdf.get_y() + 1
+    pdf.set_fill_color(226, 232, 240)  # track
+    pdf.rect(pdf.l_margin, g_y, page_w, 4, "F")
+    pdf.set_fill_color(*level_col)      # fill
+    pdf.rect(pdf.l_margin, g_y, page_w * frac, 4, "F")
+    pdf.set_y(g_y + 8)
+
+    # -- Plain-English narrative --
+    pdf.set_font("helvetica", "B", 9.5)
+    pdf.set_text_color(*TEXT_PRIMARY)
+    safe_multi(summ["headline"], style="B", size=9.5, color=TEXT_PRIMARY)
+    pdf.ln(1)
+
+    def bullet_list(title, items):
+        if not items:
+            return
+        pdf.set_font("helvetica", "B", 8.5)
+        pdf.set_text_color(*BRAND_DARK)
+        pdf.cell(0, 5, title, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        for it in items:
+            if pdf.get_y() > 255:
+                pdf.add_page()
+            pdf.set_font("helvetica", "", 8.5)
+            pdf.set_text_color(*TEXT_PRIMARY)
+            pdf.set_x(pdf.l_margin + 2)
+            pdf.multi_cell(w=page_w - 4, h=4.5, text="- " + clean(it))
+            pdf.ln(0.5)
+        pdf.ln(1)
+
+    bullet_list("What we found", summ["themes"])
+    bullet_list("What to do next", summ["actions"])
+
+    # -- Document-by-document verdicts --
+    draw_section_header("Document-by-document")
+    for fn, r in results.items():
+        if pdf.get_y() > 255:
+            pdf.add_page()
+        pdf.set_font("helvetica", "B", 8.5)
+        pdf.set_text_color(*BRAND_DARK)
+        pdf.set_x(pdf.l_margin + 2)
+        pdf.multi_cell(w=page_w - 4, h=4.5, text=clean(fn))
+        pdf.set_font("helvetica", "", 8.5)
+        pdf.set_text_color(*TEXT_PRIMARY)
+        pdf.set_x(pdf.l_margin + 4)
+        pdf.multi_cell(w=page_w - 6, h=4.5, text=clean(fe.document_verdict(fn, r, cross)))
+        pdf.ln(1.5)
+
+    # -- Reused signature/stamp visual evidence (#12) --
+    draw_signature_crops(pdf, results, cross, paths, clean, page_w,
+                         draw_section_header, BRAND_DARK, TEXT_SECONDARY)
 
     # -- Cross-document findings --
     if cross:
-        draw_section_header("Cross-Document Findings")
+        draw_section_header("Findings across documents")
         for f in cross:
             draw_finding_card(f)
 
@@ -386,6 +595,13 @@ def build_pdf_report(results, cross, brand_name="Transformatrix"):
     for fn, r in results.items():
         s = r["summary"]
         draw_section_header(f"File: {clean(fn)}")
+
+        # Plain-language verdict for this document
+        pdf.set_font("helvetica", "BI", 8.5)
+        pdf.set_text_color(*TEXT_PRIMARY)
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(w=page_w, h=4.5, text=clean(fe.document_verdict(fn, r, cross)))
+        pdf.ln(1)
 
         # Metadata table
         pdf.set_fill_color(*LIGHT_BG)
@@ -457,13 +673,13 @@ with st.sidebar:
         "8. **Cross-document** — shared assets, export clusters\n"
         "9. **Verify checklist** — what needs external proof")
     st.divider()
-    st.subheader("Severity")
+    st.subheader("How serious")
     for s, c in SEV_COLOR.items():
-        st.markdown(chip(s, c) + {"High": "act now", "Medium": "investigate",
+        st.markdown(chip(fe.HUMAN_SEVERITY[s], c) + {"High": "act now", "Medium": "investigate",
                     "Low": "note", "Info": "context"}[s], unsafe_allow_html=True)
-    st.subheader("Status")
-    for s, h in STATUS_HELP.items():
-        st.markdown(f"**{s}** — {h}")
+    st.subheader("How solid")
+    for code, human in fe.HUMAN_STATUS.items():
+        st.markdown(f"**{human}** — {STATUS_HELP[code]}")
 
 
 # --------------------------------------------------------------------------- #
@@ -493,6 +709,26 @@ c2.metric("Findings", len(rows))
 c3.metric("High severity", n_high)
 c4.metric("Confirmed facts", n_conf)
 c5.metric("To verify", n_verify)
+
+# ---- plain-language executive summary (read this first) ----
+summary = fe.build_executive_summary(results, cross)
+st.subheader("In plain English")
+st.markdown(f"**{summary['headline']}**")
+if summary["themes"]:
+    st.markdown("**What we found**")
+    st.markdown("\n".join(f"- {t}" for t in summary["themes"]))
+if summary["actions"]:
+    st.markdown("**What to do next**")
+    st.markdown("\n".join(f"- {a}" for a in summary["actions"]))
+st.caption("A flag is a question, not a verdict. These are anomalies for a human to weigh — "
+           "not proof of fraud or intent.")
+st.divider()
+
+# ---- per-document one-line verdicts ----
+st.subheader("Document-by-document, in one line")
+for fn, r in results.items():
+    st.markdown(f"- **{fn}** — {fe.document_verdict(fn, r, cross)}")
+st.divider()
 
 # ---- reused-graphic gallery (strong signal, show the actual crops) ----
 reuse = [f for f in cross if "Reused signature" in f["title"] or "Identical image" in f["title"]]
@@ -560,6 +796,7 @@ for fn, r in results.items():
     s = r["summary"]
     n = len(r["findings"])
     with st.expander(f"📄 {fn} — {n} finding{'s' if n != 1 else ''} · {s['pages']} pages"):
+        st.info(fe.document_verdict(fn, r, cross))
         st.markdown(
             f'<div class="meta">Producer: {s["producer"] or "—"}<br>'
             f'Author: {s["author"] or "—"} · Created: {s["created"] or "—"}<br>'
@@ -577,7 +814,8 @@ st.caption("What the tool cannot confirm offline. Work through these to close th
 verify_findings = [f for r in results.values() for f in r["findings"] if f["status"] == "VERIFY"]
 verify_findings += [f for f in cross if f["status"] == "VERIFY"]
 for f in verify_findings:
-    st.checkbox(f"{f['title']} — {f['detail'][:120]}", key=f"vf_{id(f)}")
+    h = fe.humanize(f)
+    st.checkbox(f"{h['headline']} — {h['action']}", key=f"vf_{id(f)}")
 for title, desc in fe.MANUAL_CHECKLIST:
     st.checkbox(f"{title} — {desc}", key=f"mc_{title}")
 
@@ -588,7 +826,7 @@ md = build_markdown(results, cross)
 json_blob = json.dumps(
     {fn: {"summary": r["summary"], "findings": r["findings"]} for fn, r in results.items()}
     | {"_cross_document": cross}, indent=2, default=str)
-pdf_bytes = build_pdf_report(results, cross)
+pdf_bytes = build_pdf_report(results, cross, paths=paths)
 
 d1.download_button("Download PDF report", pdf_bytes, file_name="forensics_report.pdf",
                    mime="application/pdf", use_container_width=True)

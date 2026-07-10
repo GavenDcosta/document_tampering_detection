@@ -78,6 +78,39 @@ def _dhash(img, hs=16):
     return [1 if px[x, y] > px[x + 1, y] else 0 for y in range(hs) for x in range(hs)]
 
 
+# Editing-software names that should not appear inside a "scanned"/original image
+IMAGE_EDITORS = [
+    "photoshop", "gimp", "illustrator", "affinity", "pixelmator", "snapseed",
+    "lightroom", "coreldraw", "paint.net", "photopea", "canva", "figma",
+    "inkscape", "acorn", "sketch",
+]
+
+
+def _exif_summary(img):
+    """Pull the forensically interesting EXIF tags out of a PIL image, if any."""
+    try:
+        exif = img.getexif()
+    except Exception:
+        return {}
+    if not exif:
+        return {}
+    # tag ids: 0x0131 Software, 0x0132 DateTime, 0x010F Make, 0x0110 Model, 0x8825 GPSInfo
+    out = {}
+    software = exif.get(0x0131)
+    if software:
+        out["software"] = str(software).strip()
+    dt = exif.get(0x0132)
+    if dt:
+        out["datetime"] = str(dt).strip()
+    make = exif.get(0x010F)
+    model = exif.get(0x0110)
+    if make or model:
+        out["camera"] = " ".join(str(x).strip() for x in (make, model) if x)
+    if 0x8825 in exif:
+        out["gps"] = True
+    return out
+
+
 def _hamming(a, b):
     return sum(1 for x, y in zip(a, b) if x != y)
 
@@ -211,8 +244,11 @@ def layer_images(path):
             except Exception:
                 continue
             data = raw["image"]
+            exif = {}
             try:
-                dh = _dhash(Image.open(io.BytesIO(data)))
+                _pi = Image.open(io.BytesIO(data))
+                dh = _dhash(_pi)
+                exif = _exif_summary(_pi)
             except Exception:
                 dh = None
             # coverage of the page by this image (full-page-raster test)
@@ -225,7 +261,7 @@ def layer_images(path):
             out.append({"page": pno + 1, "xref": xref, "w": raw.get("width"),
                         "h": raw.get("height"), "ext": raw.get("ext"),
                         "bytes": len(data), "sha16": hashlib.sha256(data).hexdigest()[:16],
-                        "dhash": dh, "coverage": cover})
+                        "dhash": dh, "coverage": cover, "exif": exif})
     return out
 
 
@@ -467,6 +503,43 @@ def analyze_document(path, filename=None):
                     page=im["page"], evidence=f"{im['w']}x{im['h']} covers "
                                               f"{int(im['coverage']*100)}% of page"))
 
+    # ---- EXIF metadata inside embedded images (signatures / stamps / logos) ----
+    # The same edited graphic (logo/stamp) can repeat on many pages; group by the
+    # image's identity so one reused asset is ONE finding listing all its pages.
+    edited_imgs = defaultdict(lambda: {"pages": set(), "w": None, "h": None})
+    gps_imgs = defaultdict(set)
+    for im in imgs:
+        ex = im.get("exif") or {}
+        soft = (ex.get("software") or "").strip()
+        if soft and any(tool in soft.lower() for tool in IMAGE_EDITORS):
+            key = (im["sha16"], soft)
+            edited_imgs[key]["pages"].add(im["page"])
+            edited_imgs[key]["w"] = im["w"]
+            edited_imgs[key]["h"] = im["h"]
+        elif ex.get("gps"):
+            gps_imgs[im["sha16"]].add(im["page"])
+    for (sha, soft), info in edited_imgs.items():
+        pages = sorted(info["pages"])
+        pg_txt = (f"page {pages[0]}" if len(pages) == 1
+                  else f"{len(pages)} pages ({pages[0]}-{pages[-1]})")
+        findings.append(_finding(
+            "Image", "Medium", "REVIEW", "Image-editing software tag inside an embedded image",
+            f"A graphic ({info['w']}x{info['h']}) on {pg_txt} carries the editing-software "
+            f"tag '{soft}' in its own EXIF metadata. A genuinely scanned or camera-original "
+            f"graphic would not normally record an image editor. Consistent with a "
+            f"signature/stamp/logo that was edited in image software before being placed.",
+            page=pages[0],
+            section=nearest_section(section_map, pages[0], 0),
+            evidence=f"EXIF Software={soft}; {info['w']}x{info['h']}; pages {pages}"))
+    for sha, pgs in gps_imgs.items():
+        pages = sorted(pgs)
+        findings.append(_finding(
+            "Image", "Low", "REVIEW", "Location data inside an embedded image",
+            f"An image on page{'s' if len(pages) > 1 else ''} {', '.join(map(str, pages))} "
+            f"carries GPS location data in its EXIF metadata. Usually harmless, but worth "
+            f"noting for provenance.",
+            page=pages[0], evidence=f"EXIF GPS present; pages {pages}"))
+
     summary = {
         "file": filename,
         "pages": doc.page_count,
@@ -579,3 +652,325 @@ MANUAL_CHECKLIST = [
     ("Amounts & terms", "Reconcile figures/terms across all documents in the pack for "
      "internal consistency."),
 ]
+
+
+# ===========================================================================
+# PLAIN-LANGUAGE LAYER
+# Turns the technical findings above into wording a non-technical reader
+# (client, lawyer, compliance officer) can act on. Everything here is copy —
+# no analysis — so the UI and every exporter share one voice.
+# ===========================================================================
+
+# Friendlier words for the internal severity / status codes.
+HUMAN_SEVERITY = {
+    "High": "Needs attention",
+    "Medium": "Worth a closer look",
+    "Low": "Minor note",
+    "Info": "Background context",
+}
+HUMAN_STATUS = {
+    "CONFIRMED": "Established fact",
+    "REVIEW": "Needs a human judgment",
+    "VERIFY": "Needs outside confirmation",
+}
+
+# title -> (plain headline, what it means, what to do)
+PLAIN_LANGUAGE = {
+    "Incremental updates present": (
+        "The file was edited and re-saved after its first save",
+        "This PDF stores more than one saved version inside it, which means content was "
+        "changed and appended after the document was first written. The earlier version "
+        "is still hidden in the file.",
+        "Have a specialist reconstruct the earlier version and compare it with the current "
+        "one to see exactly what changed (for example a date or an amount)."),
+    "Data after end-of-file marker": (
+        "Extra hidden data is attached after the document's end",
+        "There are extra bytes tacked on after the point where the PDF is supposed to end. "
+        "This can be harmless leftover data, or it can be a second file hidden inside this one.",
+        "Have someone inspect the trailing bytes to confirm whether anything is hidden there."),
+    "Digital signature object present": (
+        "The file contains a digital signature",
+        "This PDF includes a cryptographic (digital) signature. Whether that signature is "
+        "actually valid, and whether it covers the whole document, cannot be confirmed by "
+        "this offline tool.",
+        "Validate the signature and its certificate with a proper signature-checking tool "
+        "before relying on it."),
+    "Modified before created": (
+        "The 'modified' date is earlier than the 'created' date",
+        "The document's own timestamps contradict each other: it claims it was last modified "
+        "before it was created, which is impossible for an untouched file.",
+        "Treat the timestamps as unreliable and confirm the real dates from another source."),
+    "Flattened by a print-to-PDF engine": (
+        "This is a 'printed-to-PDF' copy, not the original working file",
+        "The document was produced by a print-to-PDF process (such as macOS, Chrome, or a "
+        "phone). That process rewrites the file in one pass and erases the edit history, so "
+        "we cannot tell from the PDF whether the content was changed earlier. This does not "
+        "mean it was edited - only that the PDF alone can't show us.",
+        "Ask the sender for the original source file (the Word or Excel document), which keeps "
+        "its real edit history."),
+    "Internal title exposes source provenance": (
+        "The document's hidden internal name points to a different source",
+        "Inside the file, the document's internal title names a different company, a source "
+        "filename, or a document-management number that doesn't match how the document is "
+        "branded on the page. This commonly happens when one party's template is rebranded "
+        "for another.",
+        "Confirm the named source is legitimate and that no unrelated company or template is "
+        "embedded in the document."),
+    "Authored and rendered by different tools": (
+        "Written in one program and converted to PDF by another",
+        "The document was authored in one tool (for example Microsoft Word) and turned into a "
+        "PDF by a different tool. On its own this is completely normal; it matters only as "
+        "supporting context alongside other findings.",
+        "No action needed by itself - note it only if other findings point the same way."),
+    "Late-added font (possible overlay)": (
+        "A font was added late, suggesting text was dropped on afterwards",
+        "One font was added much later than the others inside the file's structure. That "
+        "pattern often means a piece of text - a box, a stamp, or an overlay - was placed on "
+        "the page after the rest was written.",
+        "Look at the page named below to see whether that text was inserted on top rather than "
+        "typed into the document."),
+    "Mixed base fonts across the document": (
+        "The document mixes fonts from more than one source",
+        "Substantial amounts of text use different underlying font families. This can be "
+        "perfectly normal, but it can also mean the document was assembled from more than one "
+        "source or template.",
+        "Cross-check the headers, footers and logos to see whether the parts come from "
+        "different sources."),
+    "Leftover template placeholder": (
+        "An unfilled template placeholder was left in the document",
+        "A placeholder word from a template (such as 'Text', 'Click here', or 'XXXX') is still "
+        "sitting in the document next to where a real value should be. This is a strong sign a "
+        "template field was filled by dropping a value on top rather than typing it in.",
+        "Check the nearby field - the real value may have been overlaid rather than genuinely "
+        "entered."),
+    "Overlaid / inserted text": (
+        "Some text looks dropped-on rather than typed in",
+        "A piece of text is styled differently (unusual colour and font) from the surrounding "
+        "body text, which can mean it was placed on top as a separate box or form field rather "
+        "than typed into the document. Note that coloured headings and titles can trigger this "
+        "too, so it is not proof on its own.",
+        "Look at the highlighted text in context and judge whether it was genuinely part of the "
+        "document or added on top."),
+    "Near-white (possibly hidden) text": (
+        "Very faint, near-invisible text is present",
+        "There is text that is almost white, which may be invisible when the page is viewed or "
+        "printed. Sometimes this is harmless; sometimes it is deliberately hidden content.",
+        "Confirm the faint text is not hidden content sitting over a light background."),
+    "Possible fake redaction": (
+        "A blacked-out area still has readable text underneath",
+        "A black box has been drawn over some text, but the text underneath is still in the file "
+        "and can be copied out. The information was not actually removed - only visually covered.",
+        "Recover the text under the box to see what was meant to be hidden, and treat the "
+        "redaction as ineffective."),
+    "Multiple template vintages": (
+        "The document carries several different template dates",
+        "Different fixed dates recur across the pages (usually in footers or headers), which "
+        "suggests the document was stitched together from templates of different vintages rather "
+        "than produced as one consistent document.",
+        "Check which sections came from which template and whether that mix is expected."),
+    "Page is a full-page image": (
+        "A page is a scanned/flat image, not real text",
+        "One page is a single picture rather than selectable text - typically a scan or a "
+        "photographed page placed inside an otherwise digital document.",
+        "Apply image-tampering checks to that page and, where possible, obtain the original of "
+        "that page."),
+    "Identical image reused across files": (
+        "The exact same image appears in more than one document",
+        "A byte-for-byte identical image was copied and pasted across multiple documents. When "
+        "that image is a signature or stamp, it means the same graphic - not an independent "
+        "signing - was placed on each document.",
+        "Confirm the graphic was authorised for use on each document separately."),
+    "Reused signature/stamp/graphic across files": (
+        "The same signature/stamp was reused across documents",
+        "The same signature-and-stamp graphic appears on several documents that are each "
+        "presented as separately signed. A real wet signature looks slightly different every "
+        "time; an identical one means one image was reused as a digital asset. Reusing a "
+        "signature stamp can be legitimate, but these should be treated as one reused image, "
+        "not as independent signatures.",
+        "Confirm whether each document was genuinely signed, and that reuse of the signature "
+        "was authorised in each case."),
+    "Files re-exported in one session from different sources": (
+        "These documents are re-prints made in one sitting, not independent originals",
+        "Several documents were produced by the same computer within seconds of each other, yet "
+        "each names a different original author. That is consistent with one person exporting a "
+        "bundle assembled from several different source files - so these PDFs are re-prints, not "
+        "independently produced originals.",
+        "Ask for the independent originals of each document from their respective sources."),
+    "Image-editing software tag inside an embedded image": (
+        "An embedded image was touched by photo-editing software",
+        "An image inside the document (such as a signature, stamp or logo) still records that it "
+        "passed through image-editing software. A genuinely scanned or camera-original graphic "
+        "would not normally carry that tag.",
+        "Check what that image is and whether editing it was legitimate."),
+    "Location data inside an embedded image": (
+        "An embedded image contains GPS location data",
+        "An image inside the document carries GPS coordinates in its own metadata. Usually "
+        "harmless, but occasionally useful for tracing where a photo came from.",
+        "Note the location if provenance is in question; otherwise no action needed."),
+}
+
+
+def humanize(finding):
+    """Return a plain-language view of a finding for non-technical readers."""
+    title = finding.get("title", "")
+    pl = PLAIN_LANGUAGE.get(title)
+    if pl:
+        headline, means, action = pl
+    else:
+        headline, means, action = title, finding.get("detail", ""), "Review this finding."
+    return {
+        "headline": headline,
+        "means": means,
+        "action": action,
+        "severity_label": HUMAN_SEVERITY.get(finding.get("severity"), finding.get("severity")),
+        "status_label": HUMAN_STATUS.get(finding.get("status"), finding.get("status")),
+    }
+
+
+def _files_in_cross(f):
+    """Best-effort list of filenames a cross-document finding refers to."""
+    ev = f.get("evidence") or ""
+    # evidence forms: "dist 14: A.pdf p1 <-> B.pdf p3"  |  "A.pdf p1; B.pdf p2"
+    parts = re.split(r"<->|;", ev.split(":", 1)[-1])
+    files = []
+    for p in parts:
+        p = p.strip()
+        m = re.match(r"(.+?\.pdf)", p, re.I)
+        if m:
+            files.append(m.group(1).strip())
+    return files
+
+
+def build_executive_summary(results, cross):
+    """Plain-English overview: a headline, narrative points, and next steps.
+
+    Returns a dict the UI and exporters render however they like.
+    """
+    all_ff = [f for r in results.values() for f in r["findings"]] + list(cross)
+    titles = [f["title"] for f in all_ff]
+    n_high = sum(1 for f in all_ff if f["severity"] == "High")
+    n_confirmed = sum(1 for f in all_ff if f["status"] == "CONFIRMED")
+
+    def has(t):
+        return t in titles
+
+    themes = []
+
+    # 1. Reused signatures / identical images across files (strongest signal)
+    reuse = [f for f in cross if f["title"] in (
+        "Reused signature/stamp/graphic across files", "Identical image reused across files")]
+    if reuse:
+        files = set()
+        for f in reuse:
+            files.update(_files_in_cross(f))
+        n = len(files) if files else len(reuse) + 1
+        themes.append(
+            f"The same signature or stamp image was reused across {n} of the documents that "
+            f"are each presented as separately signed. A genuine signature differs every time, "
+            f"so these should be treated as one reused image, not as independent signatures.")
+
+    # 2. Single-session re-export from different sources
+    if has("Files re-exported in one session from different sources"):
+        themes.append(
+            "Several documents were produced on the same computer within seconds of each other "
+            "but name different authors - consistent with re-prints assembled from several "
+            "source files, rather than independent originals.")
+
+    # 3. Edited-after-save (incremental updates)
+    edited = [(fn, r) for fn, r in results.items()
+              if any(f["title"] == "Incremental updates present" for f in r["findings"])]
+    if edited:
+        names = ", ".join(fn for fn, _ in edited)
+        themes.append(
+            f"{names} was edited and re-saved after its first save, and the earlier version is "
+            f"still inside the file. It should be reconstructed to see what changed.")
+
+    # 4. Provenance / rebrand
+    prov = [fn for fn, r in results.items()
+            if any(f["title"] == "Internal title exposes source provenance" for f in r["findings"])]
+    if prov:
+        verb = "carry" if len(prov) > 1 else "carries"
+        themes.append(
+            f"{', '.join(prov)} {verb} a hidden internal name that points to a different "
+            f"company, source file, or template than the document's own branding.")
+
+    # 5. Overlaid values / leftover placeholders
+    if has("Leftover template placeholder") or has("Overlaid / inserted text"):
+        themes.append(
+            "At least one document has a template placeholder left in it and/or a value that "
+            "looks dropped onto the page rather than typed in - a sign a field was filled by "
+            "overlay.")
+
+    # 6. Fake redaction
+    if has("Possible fake redaction"):
+        themes.append(
+            "At least one document has a blacked-out area whose text is still readable "
+            "underneath - the information was covered, not actually removed.")
+
+    # 7. Multiple template vintages
+    if has("Multiple template vintages"):
+        themes.append(
+            "At least one document mixes several template dates, suggesting it was stitched "
+            "together from templates of different vintages.")
+
+    # 8. Scanned / re-generated copy
+    scanned = [fn for fn, r in results.items()
+               if any(f["title"] == "Page is a full-page image" for f in r["findings"])]
+    if scanned:
+        themes.append(
+            f"{', '.join(scanned)} contains a scanned image page inside an otherwise digital "
+            f"document. If it is presented as an official certificate, note it is a re-generated "
+            f"copy that cannot vouch for itself - verify the underlying record directly with the "
+            f"issuing authority.")
+
+    # Headline
+    if n_high:
+        headline = ("Several findings need your attention before these documents can be relied "
+                    "on.")
+    elif any(f["severity"] == "Medium" for f in all_ff):
+        headline = "A few things are worth a closer look, but nothing here is conclusive."
+    else:
+        headline = "Nothing significant stood out in the automated checks."
+
+    # Next steps: actions from the most serious findings, de-duplicated, plus staples
+    actions, seen = [], set()
+    for f in sorted(all_ff, key=lambda x: ["High", "Medium", "Low", "Info"].index(x["severity"])):
+        a = humanize(f)["action"]
+        if a and a not in seen and "No action needed" not in a:
+            seen.add(a)
+            actions.append(a)
+        if len(actions) >= 6:
+            break
+    for staple in ("Ask for the original source files (Word/Excel) behind each document.",
+                   "Verify each party's registration and each signatory's authority with an "
+                   "authoritative source."):
+        if staple not in seen:
+            actions.append(staple)
+
+    return {
+        "n_files": len(results),
+        "n_findings": len(all_ff),
+        "n_high": n_high,
+        "n_confirmed": n_confirmed,
+        "headline": headline,
+        "themes": themes,
+        "actions": actions,
+    }
+
+
+def document_verdict(fn, r, cross):
+    """One plain-language sentence summarising a single document."""
+    involved = [f for f in cross if fn in (f.get("evidence") or "")]
+    combined = list(r["findings"]) + involved
+    if not combined:
+        return "No automated flags - nothing stood out on this document."
+    rank = {"High": 0, "Medium": 1, "Low": 2, "Info": 3}
+    top = min(combined, key=lambda f: rank.get(f["severity"], 9))
+    headline = humanize(top)["headline"]
+    if top["severity"] == "High":
+        lead = "Needs attention"
+    elif top["severity"] == "Medium":
+        lead = "Worth a closer look"
+    else:
+        lead = "Minor notes only"
+    return f"{lead}: {headline.lower()}."

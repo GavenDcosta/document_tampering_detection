@@ -1,5 +1,9 @@
 venv/
+.venv/
 __pycache__/
+_pdfpage_*.png
+sample_report.pdf
+sample_report.md
 *.pyc
 *.pyo
 *.pyd

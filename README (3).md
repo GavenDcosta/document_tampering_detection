@@ -17,12 +17,21 @@ checklist of what still needs external verification.
 | Metadata | author/tool/timestamps, print-to-PDF flattening, internal-title provenance leaks, modified-before-created |
 | Fonts | late-added font (possible overlay), mixed base fonts (multi-source assembly) |
 | Text | leftover template placeholders, overlaid/inserted fields (rare colour + odd font), fake redactions (dark box over dark text), near-white hidden text, multiple template vintages (footer dates) |
-| Image | reused/pasted signatures & stamps (perceptual hash), full-page rasters inside a text PDF |
+| Image | reused/pasted signatures & stamps (perceptual hash), full-page rasters inside a text PDF, image-editing-software (EXIF) tags inside embedded signatures/stamps/logos |
 | Cross-document | identical or reused graphics across files, files re-exported in one session from different sources |
 | Verify checklist | source files, registration, signatory authority, cryptographic-signature validation, etc. |
 
 Upload a **whole pack** to unlock the cross-document checks — that's where the strongest
 signals (reused signatures, export-session clustering) come from.
+
+## Plain-language reports
+
+Every output (screen, PDF, Markdown) leads with a **plain-English summary** written for a
+non-technical reader: a one-line risk verdict, a "what we found / what to do next" section, and
+a one-line verdict per document. Each finding is phrased as **What it means** and **What to do**,
+with the raw technical detail (object ids, hashes, RGB values, perceptual distances) demoted to a
+footnote / expander. The PDF report also embeds the actual reused-signature crops as visual
+evidence and a risk gauge.
 
 ## Run locally
 
