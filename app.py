@@ -67,7 +67,7 @@ def chip(text, bg, fg="#fff"):
 # Bump this whenever the engine's output shape changes, so cached analyses from an
 # older code version are invalidated instead of silently reused (e.g. findings that
 # predate image evidence). It is part of the cache key below.
-ANALYSIS_VERSION = "2025-07-10-image-evidence"
+ANALYSIS_VERSION = "2025-07-10-heading-fix"
 
 
 @st.cache_data(show_spinner=False)

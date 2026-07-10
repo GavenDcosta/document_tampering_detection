@@ -222,6 +222,7 @@ def layer_fonts(doc):
 
 def layer_text(doc, section_map):
     counts = defaultdict(int)
+    size_counts = defaultdict(int)
     spans = []
     for pno, page in enumerate(doc):
         for b in page.get_text("dict")["blocks"]:
@@ -231,10 +232,13 @@ def layer_text(doc, section_map):
                     if not t:
                         continue
                     counts[s["font"]] += len(t)
+                    size_counts[round(s["size"], 1)] += len(t)
                     spans.append((pno + 1, l["bbox"][1], t, s["font"],
                                   round(s["size"], 1), s["color"]))
     dominant = max(counts, key=counts.get) if counts else None
-    return {"dominant": dominant, "counts": counts, "spans": spans}
+    dominant_size = max(size_counts, key=size_counts.get) if size_counts else None
+    return {"dominant": dominant, "dominant_size": dominant_size,
+            "counts": counts, "spans": spans}
 
 
 def layer_images(path):
@@ -441,6 +445,7 @@ def analyze_document(path, filename=None):
     # filled field / stamp caption uses a colour on very few spans. Gate overlay
     # detection on RARE colours so headings aren't flagged.
     dom = text["dominant"]
+    body_size = text.get("dominant_size")
     color_freq = Counter()
     for (_p, _y, _t, _f, _s, color) in text["spans"]:
         _l, (r, g, b) = _lum(color)
@@ -454,13 +459,17 @@ def analyze_document(path, filename=None):
         nonblack = (r, g, b) != (0, 0, 0) and not (abs(r - g) < 20 and abs(g - b) < 20 and lum > 0.25)
         rare_color = color_freq.get(color, 0) <= 4          # one-off colour
         odd_font = dom and font != dom and text["counts"][font] < 400
+        # A heading/title is LARGER than the body text; a dropped-on field/value is
+        # body-sized or smaller. Skip clearly-larger spans so coloured headings
+        # (e.g. a blue document title) aren't mistaken for inserted text.
+        looks_heading = bool(body_size) and size >= body_size + 2.0
         if placeholder:
             findings.append(_finding(
                 "Text", "High", "CONFIRMED", "Leftover template placeholder",
                 f"Placeholder text '{t}' remains on page {pno} — a template field that "
                 f"was filled by overlay (or never filled).",
                 page=pno, section=nearest_section(section_map, pno, y), evidence=t))
-        elif nonblack and rare_color and odd_font and seen_overlay < 25:
+        elif nonblack and rare_color and odd_font and not looks_heading and seen_overlay < 25:
             key = (pno, t[:40])
             if key in overlay_dedupe:
                 continue
