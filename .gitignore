@@ -2,11 +2,14 @@ venv/
 .venv/
 __pycache__/
 _pdfpage_*.png
+_sf_*.png
 sample_report.pdf
 sample_report.md
+sample_singlefile.pdf
 *.pyc
 *.pyo
 *.pyd
 .env
 .streamlit/
 .DS_Store
+sample_google.pdf

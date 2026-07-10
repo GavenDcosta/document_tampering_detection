@@ -104,7 +104,7 @@ def all_findings_rows(results, cross):
     return rows
 
 
-def render_card(f):
+def render_card(f, src_path=None):
     """Plain-language finding card. The technical detail/evidence lives in an
     expander so a non-technical reader sees the meaning first."""
     sev = f["severity"]; color = SEV_COLOR.get(sev, "#999")
@@ -122,6 +122,25 @@ def render_card(f):
         f'<div class="d"><b>What it means:</b> {h["means"]}</div>'
         f'<div class="d"><b>What to do:</b> {h["action"]}</div></div>',
         unsafe_allow_html=True)
+    # Visual evidence: the actual image this finding is about
+    ref = f.get("image_ref")
+    if src_path and ref and ref[1] is not None:
+        try:
+            st.image(fe.get_image_png(src_path, ref[1]),
+                     caption="Image in question", width=220)
+        except Exception:
+            pass
+    # Visual evidence: a row of images (e.g. several distinct logos)
+    refs_list = f.get("image_refs")
+    if src_path and refs_list:
+        st.caption("Logos found in this document:")
+        cols = st.columns(min(len(refs_list), 4))
+        for i, (_pg, xref) in enumerate(refs_list[:8]):
+            try:
+                cols[i % len(cols)].image(fe.get_image_png(src_path, xref),
+                                          caption=f"p{_pg}", use_container_width=True)
+            except Exception:
+                pass
     with st.expander("Technical detail"):
         st.markdown(f"**{f['title']}**  ·  _{f['layer']} layer · {sev} · {f['status']}_")
         st.write(f["detail"])
@@ -395,7 +414,7 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix"):
         pdf.cell(w2, 5, status, fill=True, new_x=XPos.LMARGIN, new_y=YPos.TOP)
         return w1 + w2 + 4
 
-    def draw_finding_card(f):
+    def draw_finding_card(f, src_path=None):
         h = fe.humanize(f)
         start_y = pdf.get_y()
         page_w = pdf.w - pdf.l_margin - pdf.r_margin
@@ -472,6 +491,62 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix"):
             pdf.multi_cell(w=page_w - 8, h=4, text="Technical detail: " + tech)
         except Exception:
             pass
+
+        # Visual evidence: embed the actual image this finding is about
+        ref = f.get("image_ref")
+        if src_path and ref and ref[1] is not None:
+            try:
+                from PIL import Image as _PImg
+                png = fe.get_image_png(src_path, ref[1])
+                _im = _PImg.open(io.BytesIO(png))
+                ar = (_im.height / _im.width) if _im.width else 0.3
+                disp_w = min(48, page_w - 10)
+                disp_h = min(disp_w * ar, 45)
+                if pdf.get_y() + disp_h + 6 > 275:
+                    pdf.add_page()
+                pdf.set_x(content_x)
+                pdf.set_font("helvetica", "B", 7)
+                pdf.set_text_color(*TEXT_SECONDARY)
+                pdf.cell(0, 4, "Image in question:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                iy = pdf.get_y()
+                pdf.image(io.BytesIO(png), x=content_x, y=iy, w=disp_w, h=disp_h)
+                pdf.set_y(iy + disp_h + 1)
+            except Exception:
+                pass
+
+        # Visual evidence: a row of images (e.g. several distinct logos)
+        refs_list = f.get("image_refs")
+        if src_path and refs_list:
+            try:
+                from PIL import Image as _PImg
+                pdf.set_x(content_x)
+                pdf.set_font("helvetica", "B", 7)
+                pdf.set_text_color(*TEXT_SECONDARY)
+                pdf.cell(0, 4, "Logos found in this document:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                thumb_w = 38
+                gap = 4
+                iy = pdf.get_y()
+                x = content_x
+                row_h = 0
+                for (_pg, xref) in refs_list[:6]:
+                    png = fe.get_image_png(src_path, xref)
+                    _im = _PImg.open(io.BytesIO(png))
+                    ar = (_im.height / _im.width) if _im.width else 0.3
+                    th = min(thumb_w * ar, 26)
+                    if x + thumb_w > content_x + (page_w - 8):
+                        x = content_x
+                        iy += row_h + 3
+                        row_h = 0
+                    if iy + th > 275:
+                        pdf.add_page()
+                        iy = pdf.get_y()
+                        x = content_x
+                    pdf.image(io.BytesIO(png), x=x, y=iy, w=thumb_w, h=th)
+                    x += thumb_w + gap
+                    row_h = max(row_h, th)
+                pdf.set_y(iy + row_h + 1)
+            except Exception:
+                pass
 
         end_y = pdf.get_y()
         card_h = end_y - start_y + 4
@@ -651,7 +726,7 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix"):
             continue
 
         for f in sorted(r["findings"], key=lambda x: ["High", "Medium", "Low", "Info"].index(x["severity"])):
-            draw_finding_card(f)
+            draw_finding_card(f, src_path=paths.get(fn))
 
     return bytes(pdf.output())
 
@@ -806,7 +881,7 @@ for fn, r in results.items():
         if not r["findings"]:
             st.success("No automated flags on this file.")
         for f in sorted(r["findings"], key=lambda x: sev_order.get(x["severity"], 9)):
-            render_card(f)
+            render_card(f, src_path=paths.get(fn))
 
 # ---- manual verification checklist ----
 st.subheader("Manual verification checklist")

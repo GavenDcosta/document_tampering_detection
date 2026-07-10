@@ -55,9 +55,14 @@ DATE_RE = re.compile(
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-def _finding(layer, severity, status, title, detail, page=None, section=None, evidence=None):
+def _finding(layer, severity, status, title, detail, page=None, section=None, evidence=None,
+             image_ref=None, image_refs=None):
+    # image_ref:  optional (page, xref) pointing at the single image this finding is about.
+    # image_refs: optional list of (page, xref) when a finding is about several images
+    #             (e.g. multiple distinct logos) — reports render them as a thumbnail row.
     return {"layer": layer, "severity": severity, "status": status, "title": title,
-            "detail": detail, "page": page, "section": section, "evidence": evidence}
+            "detail": detail, "page": page, "section": section, "evidence": evidence,
+            "image_ref": image_ref, "image_refs": image_refs}
 
 
 def _parse_pdf_date(s):
@@ -251,17 +256,23 @@ def layer_images(path):
                 exif = _exif_summary(_pi)
             except Exception:
                 dh = None
-            # coverage of the page by this image (full-page-raster test)
+            # coverage of the page by this image (full-page-raster test) and its
+            # top position on the page (0 = page top, 1 = bottom) to tell a header
+            # logo from a mid-page signature.
             cover = 0.0
+            top_y = None
             try:
+                ph = page.rect.height or 1
                 for r in page.get_image_rects(xref):
                     cover = max(cover, abs(r.width * r.height) / parea if parea else 0)
+                    ry = r.y0 / ph
+                    top_y = ry if top_y is None else min(top_y, ry)
             except Exception:
                 pass
             out.append({"page": pno + 1, "xref": xref, "w": raw.get("width"),
                         "h": raw.get("height"), "ext": raw.get("ext"),
                         "bytes": len(data), "sha16": hashlib.sha256(data).hexdigest()[:16],
-                        "dhash": dh, "coverage": cover, "exif": exif})
+                        "dhash": dh, "coverage": cover, "exif": exif, "rel_y": top_y})
     return out
 
 
@@ -501,21 +512,27 @@ def analyze_document(path, filename=None):
                     f"almost no text layer — a scanned or image-only page inside an "
                     f"otherwise digital document. Apply image-splice checks (ELA/noise) to it.",
                     page=im["page"], evidence=f"{im['w']}x{im['h']} covers "
-                                              f"{int(im['coverage']*100)}% of page"))
+                                              f"{int(im['coverage']*100)}% of page",
+                    image_ref=(im["page"], im["xref"])))
 
     # ---- EXIF metadata inside embedded images (signatures / stamps / logos) ----
     # The same edited graphic (logo/stamp) can repeat on many pages; group by the
     # image's identity so one reused asset is ONE finding listing all its pages.
-    edited_imgs = defaultdict(lambda: {"pages": set(), "w": None, "h": None})
+    edited_imgs = defaultdict(lambda: {"pages": set(), "w": None, "h": None,
+                                       "xref": None, "ref_page": None})
     gps_imgs = defaultdict(set)
     for im in imgs:
         ex = im.get("exif") or {}
         soft = (ex.get("software") or "").strip()
         if soft and any(tool in soft.lower() for tool in IMAGE_EDITORS):
             key = (im["sha16"], soft)
-            edited_imgs[key]["pages"].add(im["page"])
-            edited_imgs[key]["w"] = im["w"]
-            edited_imgs[key]["h"] = im["h"]
+            info = edited_imgs[key]
+            info["pages"].add(im["page"])
+            info["w"] = im["w"]
+            info["h"] = im["h"]
+            if info["xref"] is None:
+                info["xref"] = im["xref"]
+                info["ref_page"] = im["page"]
         elif ex.get("gps"):
             gps_imgs[im["sha16"]].add(im["page"])
     for (sha, soft), info in edited_imgs.items():
@@ -530,7 +547,8 @@ def analyze_document(path, filename=None):
             f"signature/stamp/logo that was edited in image software before being placed.",
             page=pages[0],
             section=nearest_section(section_map, pages[0], 0),
-            evidence=f"EXIF Software={soft}; {info['w']}x{info['h']}; pages {pages}"))
+            evidence=f"EXIF Software={soft}; {info['w']}x{info['h']}; pages {pages}",
+            image_ref=(info["ref_page"], info["xref"])))
     for sha, pgs in gps_imgs.items():
         pages = sorted(pgs)
         findings.append(_finding(
@@ -539,6 +557,42 @@ def analyze_document(path, filename=None):
             f"carries GPS location data in its EXIF metadata. Usually harmless, but worth "
             f"noting for provenance.",
             page=pages[0], evidence=f"EXIF GPS present; pages {pages}"))
+
+    # ---- multiple distinct logos / letterheads (possible multi-source assembly) ----
+    # Header graphics = small images sitting near the top of a page. A single-source
+    # document reuses one logo; several visually different header marks suggest the
+    # document was stitched from more than one source/template (or a rebrand left an
+    # older logo behind on some pages). Signatures sit mid-page, so they're excluded.
+    header_imgs = [im for im in imgs if im.get("dhash") and im["coverage"] < 0.5
+                   and im.get("rel_y") is not None and im["rel_y"] < 0.20]
+    logo_clusters = []
+    for im in header_imgs:
+        for c in logo_clusters:
+            if _hamming(c["rep"]["dhash"], im["dhash"]) <= 10:
+                c["pages"].add(im["page"])
+                break
+        else:
+            logo_clusters.append({"rep": im, "pages": {im["page"]}})
+    if len(logo_clusters) >= 2:
+        logo_clusters.sort(key=lambda c: min(c["pages"]))
+        parts = []
+        for c in logo_clusters:
+            ps = sorted(c["pages"])
+            rng = f"page {ps[0]}" if len(ps) == 1 else f"pages {ps[0]}-{ps[-1]}"
+            parts.append(f"{c['rep']['w']}x{c['rep']['h']} on {rng}")
+        refs = [(c["rep"]["page"], c["rep"]["xref"]) for c in logo_clusters]
+        findings.append(_finding(
+            "Image", "Medium", "REVIEW",
+            "Multiple distinct logos / letterheads in one document",
+            f"This document uses {len(logo_clusters)} visually different header graphics "
+            f"(logos/letterheads): {'; '.join(parts)}. A single-source document normally "
+            f"reuses one logo throughout. Several different marks — especially across "
+            f"different page ranges — suggest the document was assembled from more than one "
+            f"source or template, or that a rebrand left an older brand's logo behind on "
+            f"some pages. Check each logo below and confirm they all belong to the "
+            f"represented party.",
+            page=min(min(c["pages"]) for c in logo_clusters),
+            evidence="; ".join(parts), image_refs=refs))
 
     summary = {
         "file": filename,
@@ -796,6 +850,14 @@ PLAIN_LANGUAGE = {
         "bundle assembled from several different source files - so these PDFs are re-prints, not "
         "independently produced originals.",
         "Ask for the independent originals of each document from their respective sources."),
+    "Multiple distinct logos / letterheads in one document": (
+        "The document uses more than one logo / letterhead",
+        "The pages don't all carry the same logo. A document produced from a single source "
+        "normally uses one letterhead throughout. Several different header logos - especially "
+        "on different page ranges - suggest the document was assembled from more than one "
+        "source or template, or that a rebrand left an old brand's logo behind on some pages.",
+        "Look at the logos shown and confirm they all belong to the party this document is "
+        "meant to be from. An unexpected brand is a strong lead."),
     "Image-editing software tag inside an embedded image": (
         "An embedded image was touched by photo-editing software",
         "An image inside the document (such as a signature, stamp or logo) still records that it "
@@ -906,6 +968,16 @@ def build_executive_summary(results, cross):
         themes.append(
             "At least one document has a blacked-out area whose text is still readable "
             "underneath - the information was covered, not actually removed.")
+
+    # 6b. Multiple distinct logos / letterheads
+    multilogo = [fn for fn, r in results.items()
+                 if any(f["title"] == "Multiple distinct logos / letterheads in one document"
+                        for f in r["findings"])]
+    if multilogo:
+        themes.append(
+            f"{', '.join(multilogo)} uses more than one logo/letterhead across its pages, "
+            f"which suggests it was assembled from more than one source or template (or a "
+            f"rebrand left an older brand's logo behind). The logos are shown in the report.")
 
     # 7. Multiple template vintages
     if has("Multiple template vintages"):
