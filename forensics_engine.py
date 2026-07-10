@@ -609,6 +609,13 @@ def layer_metadata(path):
     md = {"info": {}, "xmp": {}}
     doc = fitz.open(path)
     md["info"] = {k: v for k, v in (doc.metadata or {}).items() if v}
+    try:
+        if hasattr(doc, 'get_xml_metadata'):
+            xml = doc.get_xml_metadata()
+            if xml:
+                md["xmp_raw"] = xml
+    except Exception:
+        pass
     if pikepdf:
         try:
             pdf = pikepdf.open(path)
@@ -998,6 +1005,15 @@ def analyze_document(path, filename=None):
             "Metadata", "Medium", "REVIEW", "Modified before created",
             f"ModDate ({mdate}) precedes CreationDate ({cdate}) — inconsistent timestamps.",
             evidence=f"created {cdate} / modified {mdate}"))
+            
+    xmp_raw = meta.get("xmp_raw", "")
+    if xmp_raw:
+        history_tags = re.findall(r'<stEvt:action>saved</stEvt:action>', xmp_raw)
+        if len(history_tags) > 1:
+            findings.append(_finding(
+                "Metadata", "Medium", "REVIEW", "Document history shows past editing",
+                f"The XMP metadata contains a history trail showing the document was edited and saved {len(history_tags)} times by editing software. A born-digital fresh print usually has no history.",
+                evidence=f"{len(history_tags)} save events in XMP history"))
 
     prod_l = producer.lower()
     is_flat = any(p in prod_l for p in FLATTENING_PRODUCERS)
@@ -1350,7 +1366,7 @@ def analyze_document(path, filename=None):
     }
     return {"summary": summary, "findings": findings, "_images": imgs,
             "_created_dt": cdate, "_producer": producer, "_author": author,
-            "_ocr_texts": ocr_texts}
+            "_ocr_texts": ocr_texts, "_xmp_raw": meta.get("xmp_raw", "")}
 
 
 # ---------------------------------------------------------------------------

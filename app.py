@@ -311,7 +311,7 @@ def draw_signature_crops(pdf, results, cross, paths, clean, page_w,
     pdf.ln(1)
 
 
-def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix"):
+def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix", ai_report=None):
     from fpdf import FPDF
     from fpdf.enums import XPos, YPos
     import datetime
@@ -679,9 +679,69 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix"):
             pdf.ln(0.5)
         pdf.ln(1)
 
-    bullet_list("Established facts (definitive, reproducible)",
-                summ.get("established_facts"), bold_items=True, title_color=SEV["High"])
-    bullet_list("Anomalies requiring judgment", summ["themes"])
+    # -- Detected Issues Table --
+    pdf.set_font("helvetica", "B", 9)
+    pdf.set_text_color(*BRAND_DARK)
+    pdf.cell(0, 6, "Detected Issues Overview", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    
+    col_w = [25, 30, page_w - 55]
+    pdf.set_fill_color(240, 240, 240)
+    pdf.set_font("helvetica", "B", 8)
+    pdf.set_text_color(50, 50, 50)
+    
+    pdf.cell(col_w[0], 6, "Category", border=1, fill=True)
+    pdf.cell(col_w[1], 6, "Method", border=1, fill=True)
+    pdf.cell(col_w[2], 6, "Issue Detected", border=1, fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    
+    pdf.set_font("helvetica", "", 8)
+    pdf.set_text_color(*TEXT_PRIMARY)
+    
+    all_findings = []
+    for r in results.values():
+        all_findings.extend(r["findings"])
+    all_findings.extend(cross)
+    
+    def sort_key(f):
+        return 0 if f["status"] == "CONFIRMED" else 1
+    
+    fill = False
+    for f in sorted(all_findings, key=sort_key):
+        if pdf.get_y() > 250:
+            pdf.add_page()
+            pdf.set_font("helvetica", "B", 8)
+            pdf.cell(col_w[0], 6, "Category", border=1, fill=True)
+            pdf.cell(col_w[1], 6, "Method", border=1, fill=True)
+            pdf.cell(col_w[2], 6, "Issue Detected", border=1, fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font("helvetica", "", 8)
+            
+        if fill:
+            pdf.set_fill_color(250, 250, 250)
+        else:
+            pdf.set_fill_color(255, 255, 255)
+        
+        cat = "Fact" if f["status"] == "CONFIRMED" else "Anomaly"
+        method = f.get("layer", "Cross-document")
+        issue = clean(f["title"])
+        
+        start_y = pdf.get_y()
+        pdf.set_xy(pdf.l_margin + col_w[0] + col_w[1], start_y + 1)
+        pdf.multi_cell(col_w[2], 4, issue, border=0)
+        end_y = pdf.get_y()
+        h = max(end_y - start_y + 1, 6)
+        
+        pdf.set_xy(pdf.l_margin, start_y)
+        pdf.cell(col_w[0], h, cat, border=1, fill=fill)
+        pdf.cell(col_w[1], h, method, border=1, fill=fill)
+        pdf.rect(pdf.l_margin + col_w[0] + col_w[1], start_y, col_w[2], h, "DF" if fill else "D")
+        
+        pdf.set_xy(pdf.l_margin + col_w[0] + col_w[1], start_y + 1)
+        pdf.multi_cell(col_w[2], 4, issue, border=0)
+        
+        pdf.set_y(start_y + h)
+        fill = not fill
+        
+    pdf.ln(4)
+
     bullet_list("What to do next", summ["actions"])
 
     # -- Document-by-document verdicts --
@@ -771,8 +831,51 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix"):
         for f in sorted(r["findings"], key=lambda x: ["High", "Medium", "Low", "Info"].index(x["severity"])):
             draw_finding_card(f, src_path=paths.get(fn))
 
-    return bytes(pdf.output())
+    # -- XMP Metadata History Section --
+    has_xmp = any(r.get("_xmp_raw") for r in results.values())
+    draw_section_header("XMP Metadata History (Raw)")
+    if has_xmp:
+        for fn, r in results.items():
+            xmp = r.get("_xmp_raw")
+            if xmp:
+                if pdf.get_y() > 255:
+                    pdf.add_page()
+                pdf.set_font("helvetica", "B", 8.5)
+                pdf.set_text_color(*BRAND_DARK)
+                pdf.cell(0, 5, f"File: {clean(fn)}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                pdf.set_font("courier", "", 7)
+                pdf.set_text_color(*TEXT_PRIMARY)
+                pdf.set_fill_color(*LIGHT_BG)
+                
+                import textwrap
+                xmp_text = clean(xmp)[:5000]
+                if len(xmp) > 5000:
+                    xmp_text += "\n...[truncated]..."
+                wrapped_lines = []
+                for line in xmp_text.splitlines():
+                    wrapped_lines.extend(textwrap.wrap(line, width=120) or [""])
+                
+                pdf.multi_cell(0, 4, "\n".join(wrapped_lines), fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                pdf.ln(2)
+    else:
+        pdf.set_font("helvetica", "I", 9)
+        pdf.set_text_color(*TEXT_SECONDARY)
+        pdf.cell(0, 5, "No XMP metadata found in these files. (This is normal for many documents).", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(2)
+        
+    # -- AI Web Verification Section --
+    if ai_report:
+        draw_section_header("AI Web Verification Results")
+        if pdf.get_y() > 240:
+            pdf.add_page()
+        pdf.set_font("helvetica", "", 9)
+        pdf.set_text_color(*TEXT_PRIMARY)
+        # Gemini often uses markdown, so clean it slightly for PDF
+        ai_text = clean(ai_report).replace("**", "")
+        pdf.multi_cell(0, 5, ai_text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(2)
 
+    return bytes(pdf.output())
 
 # --------------------------------------------------------------------------- #
 # sidebar
@@ -935,6 +1038,16 @@ for fn, r in results.items():
         for f in sorted(r["findings"], key=lambda x: sev_order.get(x["severity"], 9)):
             render_card(f, src_path=paths.get(fn))
 
+# ---- XMP Metadata History ----
+st.subheader("XMP Metadata History (Raw)")
+has_xmp = any(r.get("_xmp_raw") for r in results.values())
+if has_xmp:
+    for fn, r in results.items():
+        if r.get("_xmp_raw"):
+            with st.expander(f"View XMP for {fn}"):
+                st.code(r["_xmp_raw"], language="xml")
+else:
+    st.info("No XMP metadata history found in these files. (This is normal for many documents).")
 # ---- manual verification checklist ----
 st.subheader("Manual verification checklist")
 st.caption("What the tool cannot confirm offline. Work through these to close the case.")
@@ -949,6 +1062,32 @@ for i, (fn, f) in enumerate(verify_findings):
     st.checkbox(f"{h['headline']} — {h['action']}", key=key)
 for title, desc in fe.MANUAL_CHECKLIST:
     st.checkbox(f"{title} — {desc}", key=f"mc_{title}")
+
+# ---- AI Web Verification ----
+st.subheader("AI Web Verification")
+st.caption("Uses Gemini 2.5 Flash and Google Search to verify entities (companies, names) found in the document anomalies.")
+api_key = st.secrets.get("GOOGLE_API_KEY")
+
+if "ai_report" not in st.session_state:
+    if not api_key:
+        st.error("Please add GOOGLE_API_KEY to your .streamlit/secrets.toml file.")
+    else:
+        import ai_verifier
+        with st.spinner("Searching the web and analyzing findings..."):
+            findings_text = ""
+            for fn, r in results.items():
+                findings_text += f"\nFile: {fn}\n"
+                for f in r["findings"]:
+                    findings_text += f"- {f['title']}: {f.get('detail', '')}\n"
+            for f in cross:
+                findings_text += f"- Cross-document: {f['title']}: {f.get('detail', '')}\n"
+                 
+            ai_report = ai_verifier.verify_findings_with_ai(findings_text, api_key)
+            st.session_state["ai_report"] = ai_report
+
+if "ai_report" in st.session_state:
+    st.markdown("### AI Verification Results")
+    st.markdown(st.session_state["ai_report"])
 
 # ---- downloads ----
 st.subheader("Export report")
@@ -979,7 +1118,7 @@ json_blob = json.dumps(
     {fn: {"summary": r["summary"], "findings": _json_findings(r["findings"])}
      for fn, r in results.items()}
     | {"_cross_document": _json_findings(cross)}, indent=2, default=str)
-pdf_bytes = build_pdf_report(results, cross, paths=paths)
+pdf_bytes = build_pdf_report(results, cross, paths=paths, ai_report=st.session_state.get("ai_report"))
 
 d1.download_button("Download PDF report", pdf_bytes, file_name=f"{base}.pdf",
                    mime="application/pdf", use_container_width=True)
