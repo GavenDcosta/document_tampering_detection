@@ -127,7 +127,7 @@ def render_card(f, src_path=None):
         f'<div class="card" style="border-left-color:{color}">'
         f'{chip(h["severity_label"], color)}{chip(h["status_label"], "#fff", SEV_COLOR["Info"])}'
         f'<span class="t">{h["headline"]}</span>{loc}'
-        f'<div class="d"><b>What it means:</b> {h["means"]}</div>'
+        f'<div class="d"><b>What we found:</b> {f["detail"]}</div>'
         f'<div class="d"><b>What to do:</b> {h["action"]}</div></div>',
         unsafe_allow_html=True)
     # Visual evidence: a generated image (e.g. ELA heatmap) carried on the finding
@@ -202,10 +202,10 @@ def build_markdown(results, cross):
         loc = (f" (page {f['page']}" + (f", §{f['section']}" if f.get("section") else "") + ")") \
             if f.get("page") else ""
         L.append(f"- **[{h['severity_label']}] {h['headline']}**{loc}")
-        L.append(f"    - *What it means:* {h['means']}")
+        L.append(f"    - *What we found:* {f['detail']}")
         L.append(f"    - *What to do:* {h['action']}")
-        L.append(f"    - *Technical detail:* {f['detail']}"
-                 f"{'  `'+f['evidence']+'`' if f.get('evidence') else ''}")
+        if f.get("evidence"):
+            L.append(f"    - *Evidence:* `{f['evidence']}`")
 
     if cross:
         L.append("## Findings across documents\n")
@@ -314,6 +314,7 @@ def draw_signature_crops(pdf, results, cross, paths, clean, page_w,
 def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix", ai_report=None):
     from fpdf import FPDF
     from fpdf.enums import XPos, YPos
+    from fpdf.fonts import FontFace
     import datetime
     paths = paths or {}
 
@@ -322,13 +323,23 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix", ai
     BRAND_ACCENT = (59, 130, 246)   # blue-500
     WHITE = (255, 255, 255)
     LIGHT_BG = (241, 245, 249)      # slate-100
+    CARD_BG = (250, 251, 253)       # near-white card fill
+    HAIRLINE = (226, 232, 240)      # slate-200 borders
     TEXT_PRIMARY = (30, 41, 59)      # slate-800
     TEXT_SECONDARY = (100, 116, 139) # slate-500
+    TEXT_MUTED = (148, 163, 184)     # slate-400
     SEV = {
         "High": (220, 38, 38),      # red-600
         "Medium": (217, 119, 6),    # amber-600
         "Low": (37, 99, 235),       # blue-600
-        "Info": (107, 114, 128),    # gray-500
+        "Info": (100, 116, 139),    # slate-500
+    }
+    # soft pill tints: (background, text) — modern, less heavy than solid fills
+    SEV_TINT = {
+        "High": ((254, 226, 226), (185, 28, 28)),     # red-100 / red-700
+        "Medium": ((254, 243, 199), (180, 83, 9)),    # amber-100 / amber-700
+        "Low": ((219, 234, 254), (29, 78, 216)),      # blue-100 / blue-700
+        "Info": ((241, 245, 249), (71, 85, 105)),     # slate-100 / slate-600
     }
 
     # Map common unicode punctuation to ASCII so the core PDF fonts (latin-1) don't
@@ -413,30 +424,34 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix", ai
             pass
 
     def draw_section_header(title):
-        pdf.ln(4)
+        pdf.ln(5)
+        y = pdf.get_y()
         pdf.set_fill_color(*BRAND_ACCENT)
-        pdf.rect(pdf.l_margin, pdf.get_y(), 3, 8, "F")
-        pdf.set_x(pdf.l_margin + 6)
-        pdf.set_font("helvetica", "B", 13)
+        pdf.rect(pdf.l_margin, y + 0.5, 3.5, 6.5, round_corners=True, corner_radius=1, style="F")
+        pdf.set_xy(pdf.l_margin + 7, y)
+        pdf.set_font("helvetica", "B", 12.5)
         pdf.set_text_color(*BRAND_DARK)
-        pdf.cell(0, 8, title, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.ln(2)
+        pdf.cell(0, 7.5, title, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        # thin underline rule
+        pdf.set_draw_color(*HAIRLINE)
+        pdf.set_line_width(0.3)
+        pdf.line(pdf.l_margin, pdf.get_y() + 0.5, pdf.w - pdf.r_margin, pdf.get_y() + 0.5)
+        pdf.ln(3)
 
-    def draw_severity_badge(severity, status, x, y):
-        color = SEV.get(severity, (128, 128, 128))
-        # Severity pill
-        pdf.set_fill_color(*color)
-        pdf.set_xy(x, y)
-        pdf.set_font("helvetica", "B", 7)
-        pdf.set_text_color(*WHITE)
-        w1 = pdf.get_string_width(severity) + 6
-        pdf.cell(w1, 5, severity, fill=True, new_x=XPos.END, new_y=YPos.TOP)
-        # Status pill
-        pdf.set_fill_color(*LIGHT_BG)
-        pdf.set_text_color(*TEXT_SECONDARY)
-        pdf.set_font("helvetica", "", 7)
-        w2 = pdf.get_string_width(status) + 6
-        pdf.cell(w2, 5, status, fill=True, new_x=XPos.LMARGIN, new_y=YPos.TOP)
+    def _pill(text, x, y, bg, fg, h=5.0):
+        pdf.set_font("helvetica", "B", 6.5)
+        w = pdf.get_string_width(text) + 5
+        pdf.set_fill_color(*bg)
+        pdf.rect(x, y, w, h, round_corners=True, corner_radius=1.4, style="F")
+        pdf.set_text_color(*fg)
+        pdf.set_xy(x, y + 0.5)
+        pdf.cell(w, h - 1, text, align="C")
+        return w
+
+    def draw_severity_badge(sev_key, sev_label, status, x, y):
+        bg, fg = SEV_TINT.get(sev_key, ((241, 245, 249), (71, 85, 105)))
+        w1 = _pill(sev_label, x, y, bg, fg)
+        w2 = _pill(status, x + w1 + 2, y, LIGHT_BG, TEXT_SECONDARY)
         return w1 + w2 + 4
 
     def draw_finding_card(f, src_path=None):
@@ -456,7 +471,7 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix", ai
         badge_y = start_y + 3
 
         # Badges (plain-language labels)
-        draw_severity_badge(h["severity_label"], h["status_label"], content_x, badge_y)
+        draw_severity_badge(f["severity"], h["severity_label"], h["status_label"], content_x, badge_y)
 
         # Location tag
         loc = ""
@@ -479,43 +494,35 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix", ai
         except Exception:
             pass
 
-        # What it means
-        pdf.set_x(content_x)
-        pdf.set_font("helvetica", "B", 8)
-        pdf.set_text_color(*TEXT_SECONDARY)
-        pdf.cell(0, 4.5, "What it means", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_x(content_x)
-        pdf.set_font("helvetica", "", 8.5)
-        pdf.set_text_color(*TEXT_PRIMARY)
-        try:
-            pdf.multi_cell(w=page_w - 8, h=4.5, text=clean(h["means"]))
-        except Exception:
-            pass
+        def field(label, body):
+            pdf.ln(1)
+            pdf.set_x(content_x)
+            pdf.set_font("helvetica", "B", 6.8)
+            pdf.set_text_color(*BRAND_ACCENT)
+            pdf.cell(0, 3.8, label.upper(), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_x(content_x)
+            pdf.set_font("helvetica", "", 8.7)
+            pdf.set_text_color(*TEXT_PRIMARY)
+            try:
+                pdf.multi_cell(w=page_w - 10, h=4.6, text=clean(body))
+            except Exception:
+                pass
 
-        # What to do
-        pdf.set_x(content_x)
-        pdf.set_font("helvetica", "B", 8)
-        pdf.set_text_color(*TEXT_SECONDARY)
-        pdf.cell(0, 4.5, "What to do", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_x(content_x)
-        pdf.set_font("helvetica", "", 8.5)
-        pdf.set_text_color(*TEXT_PRIMARY)
-        try:
-            pdf.multi_cell(w=page_w - 8, h=4.5, text=clean(h["action"]))
-        except Exception:
-            pass
+        # Lead with the SPECIFIC finding (dark, readable), then the action.
+        field("What we found", f["detail"])
+        field("What to do", h["action"])
 
-        # Technical detail (smaller, muted)
-        pdf.set_x(content_x)
-        pdf.set_font("helvetica", "I", 7.5)
-        pdf.set_text_color(*TEXT_SECONDARY)
-        tech = clean(f["detail"])
+        # raw evidence as a small footnote
         if f.get("evidence"):
-            tech += "  [" + clean(f["evidence"])[:120] + "]"
-        try:
-            pdf.multi_cell(w=page_w - 8, h=4, text="Technical detail: " + tech)
-        except Exception:
-            pass
+            pdf.ln(0.5)
+            pdf.set_x(content_x)
+            pdf.set_font("helvetica", "I", 7)
+            pdf.set_text_color(*TEXT_MUTED)
+            try:
+                pdf.multi_cell(w=page_w - 10, h=3.6,
+                               text="Evidence: " + clean(f["evidence"])[:170])
+            except Exception:
+                pass
 
         # Visual evidence: a generated image (e.g. an ELA heatmap) on the finding itself
         gen = f.get("image_png")
@@ -595,56 +602,68 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix", ai
                 pass
 
         end_y = pdf.get_y()
-        card_h = end_y - start_y + 4
-
-        # Draw card background and left border (behind text - we re-draw)
-        # Left color stripe
-        pdf.set_fill_color(*color)
-        pdf.rect(card_x, start_y, 2.5, card_h, "F")
-        # Light border line at bottom
-        pdf.set_draw_color(226, 232, 240)
-        pdf.line(card_x, end_y + 3, card_x + page_w, end_y + 3)
-
-        pdf.set_y(end_y + 5)
+        # Frame the card only if it stayed on one page (no mid-card page break)
+        if start_y < end_y < 286:
+            card_h = end_y - start_y + 2
+            pdf.set_draw_color(*HAIRLINE)
+            pdf.set_line_width(0.3)
+            pdf.rect(card_x, start_y - 1.5, page_w, card_h + 3,
+                     round_corners=True, corner_radius=2, style="D")
+            pdf.set_fill_color(*color)
+            pdf.rect(card_x, start_y - 1.5, 2.4, card_h + 3,
+                     round_corners=True, corner_radius=1, style="F")
+        pdf.set_y(end_y + 6)
 
     # ===== REPORT CONTENT =====
 
-    # -- Report info box --
-    pdf.set_fill_color(*LIGHT_BG)
-    pdf.rect(pdf.l_margin, pdf.get_y(), pdf.w - pdf.l_margin - pdf.r_margin, 14, "F")
-    pdf.set_xy(pdf.l_margin + 3, pdf.get_y() + 2)
-    safe_cell(f"Report Date: {datetime.datetime.now():%B %d, %Y at %H:%M}", size=9, color=TEXT_PRIMARY)
-    pdf.set_x(pdf.l_margin + 3)
-    safe_cell("Findings are given in two tiers: established facts (definitive, reproducible) and "
-              "anomalies requiring human judgment. Neither alone is a legal finding of fraud.",
-              style="I", size=8, color=TEXT_SECONDARY)
-    pdf.ln(4)
+    page_w = pdf.w - pdf.l_margin - pdf.r_margin
 
-    # -- Summary metrics --
+    # -- Report info box (wrapped, not truncated) --
+    info_y = pdf.get_y()
+    pdf.set_fill_color(*LIGHT_BG)
+    pdf.rect(pdf.l_margin, info_y, page_w, 17, round_corners=True, corner_radius=2, style="F")
+    pdf.set_xy(pdf.l_margin + 4, info_y + 2.5)
+    pdf.set_font("helvetica", "B", 9)
+    pdf.set_text_color(*TEXT_PRIMARY)
+    pdf.cell(0, 4.5, f"Report Date: {datetime.datetime.now():%B %d, %Y at %H:%M}",
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_xy(pdf.l_margin + 4, pdf.get_y() + 0.5)
+    pdf.set_font("helvetica", "I", 7.8)
+    pdf.set_text_color(*TEXT_SECONDARY)
+    pdf.multi_cell(page_w - 8, 3.9, clean(
+        "Findings come in two tiers: established facts (definitive and reproducible) and "
+        "anomalies requiring human judgment. Neither alone is a legal finding of fraud."))
+    pdf.set_y(info_y + 20)
+
+    # -- Summary metrics as three tiles --
     summ = fe.build_executive_summary(results, cross)
     total_findings = summ["n_findings"]
     high_count = summ["n_high"]
     med_count = sum(1 for r in results.values() for f in r["findings"] if f["severity"] == "Medium")
     med_count += sum(1 for f in cross if f["severity"] == "Medium")
-    page_w = pdf.w - pdf.l_margin - pdf.r_margin
 
     draw_section_header("Executive Summary")
-    pdf.set_fill_color(*LIGHT_BG)
+    tile_gap = 4
+    tile_w = (page_w - 2 * tile_gap) / 3
     box_y = pdf.get_y()
-    pdf.rect(pdf.l_margin, box_y, page_w, 12, "F")
-    box_w = page_w / 3
-    for i, (label, val) in enumerate([("Files Analyzed", str(len(results))),
-                                       ("Total Findings", str(total_findings)),
-                                       ("Need Attention", str(high_count))]):
-        pdf.set_xy(pdf.l_margin + i * box_w + 3, box_y + 1)
-        pdf.set_font("helvetica", "", 7)
+    tiles = [("FILES ANALYSED", str(len(results)), BRAND_DARK),
+             ("TOTAL FINDINGS", str(total_findings), BRAND_DARK),
+             ("NEED ATTENTION", str(high_count), SEV["High"] if high_count else BRAND_DARK)]
+    for i, (label, val, valcol) in enumerate(tiles):
+        tx = pdf.l_margin + i * (tile_w + tile_gap)
+        pdf.set_fill_color(*CARD_BG)
+        pdf.set_draw_color(*HAIRLINE)
+        pdf.set_line_width(0.3)
+        pdf.rect(tx, box_y, tile_w, 16, round_corners=True, corner_radius=2, style="DF")
+        pdf.set_xy(tx, box_y + 2.5)
+        pdf.set_font("helvetica", "B", 6.8)
         pdf.set_text_color(*TEXT_SECONDARY)
-        pdf.cell(box_w - 6, 4, label, new_x=XPos.LEFT, new_y=YPos.NEXT)
-        pdf.set_x(pdf.l_margin + i * box_w + 3)
-        pdf.set_font("helvetica", "B", 14)
-        pdf.set_text_color(*BRAND_DARK)
-        pdf.cell(box_w - 6, 6, val, new_x=XPos.LEFT, new_y=YPos.NEXT)
-    pdf.set_y(box_y + 16)
+        pdf.cell(tile_w, 4, label, align="C")
+        pdf.set_xy(tx, box_y + 6.5)
+        pdf.set_font("helvetica", "B", 17)
+        pdf.set_text_color(*valcol)
+        pdf.cell(tile_w, 8, val, align="C")
+    pdf.set_y(box_y + 20)
 
     # -- Risk gauge (#12) --
     if high_count > 0:
@@ -653,15 +672,22 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix", ai
         level_txt, level_col, frac = "Some review needed", SEV["Medium"], 0.5
     else:
         level_txt, level_col, frac = "Low", (22, 163, 74), 0.16
-    pdf.set_font("helvetica", "B", 8)
+    pdf.set_font("helvetica", "B", 7)
     pdf.set_text_color(*TEXT_SECONDARY)
-    pdf.cell(0, 4.5, f"Overall risk level: {level_txt}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    g_y = pdf.get_y() + 1
-    pdf.set_fill_color(226, 232, 240)  # track
-    pdf.rect(pdf.l_margin, g_y, page_w, 4, "F")
-    pdf.set_fill_color(*level_col)      # fill
-    pdf.rect(pdf.l_margin, g_y, page_w * frac, 4, "F")
-    pdf.set_y(g_y + 8)
+    pdf.cell(0, 4, "OVERALL RISK LEVEL", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    g_y = pdf.get_y() + 0.5
+    pdf.set_fill_color(*HAIRLINE)   # track
+    pdf.rect(pdf.l_margin, g_y, page_w, 5, round_corners=True, corner_radius=2.5, style="F")
+    if frac > 0:
+        pdf.set_fill_color(*level_col)  # fill
+        pdf.rect(pdf.l_margin, g_y, max(page_w * frac, 5), 5,
+                 round_corners=True, corner_radius=2.5, style="F")
+    # level label sitting on the bar
+    pdf.set_xy(pdf.l_margin + 2, g_y + 0.6)
+    pdf.set_font("helvetica", "B", 7.5)
+    pdf.set_text_color(*WHITE)
+    pdf.cell(0, 3.8, level_txt)
+    pdf.set_y(g_y + 9)
 
     # -- Plain-English narrative --
     pdf.set_font("helvetica", "B", 9.5)
@@ -685,68 +711,45 @@ def build_pdf_report(results, cross, paths=None, brand_name="Transformatrix", ai
             pdf.ln(0.5)
         pdf.ln(1)
 
-    # -- Detected Issues Table --
-    pdf.set_font("helvetica", "B", 9)
-    pdf.set_text_color(*BRAND_DARK)
-    pdf.cell(0, 6, "Detected Issues Overview", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    
-    col_w = [25, 30, page_w - 55]
-    pdf.set_fill_color(240, 240, 240)
-    pdf.set_font("helvetica", "B", 8)
-    pdf.set_text_color(50, 50, 50)
-    
-    pdf.cell(col_w[0], 6, "Category", border=1, fill=True)
-    pdf.cell(col_w[1], 6, "Method", border=1, fill=True)
-    pdf.cell(col_w[2], 6, "Issue Detected", border=1, fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    
-    pdf.set_font("helvetica", "", 8)
+    # -- Findings summary table (plain-language, layman) --
+    draw_section_header("What we found - at a glance")
+    pdf.set_font("helvetica", "I", 8)
+    pdf.set_text_color(*TEXT_SECONDARY)
+    pdf.multi_cell(page_w, 4, clean(
+        "Every issue found, in plain English. The most serious are listed first. Full detail, "
+        "images and technical proof for each one are in the sections that follow."))
+    pdf.ln(1.5)
+
+    all_findings = [f for r in results.values() for f in r["findings"]] + list(cross)
+    sev_order = {"High": 0, "Medium": 1, "Low": 2, "Info": 3}
+    all_findings.sort(key=lambda f: sev_order.get(f["severity"], 9))
+
+    # reset colours (draw_section_header leaves fill = accent blue)
+    pdf.set_fill_color(255, 255, 255)
     pdf.set_text_color(*TEXT_PRIMARY)
-    
-    all_findings = []
-    for r in results.values():
-        all_findings.extend(r["findings"])
-    all_findings.extend(cross)
-    
-    def sort_key(f):
-        return 0 if f["status"] == "CONFIRMED" else 1
-    
-    fill = False
-    for f in sorted(all_findings, key=sort_key):
-        if pdf.get_y() > 250:
-            pdf.add_page()
-            pdf.set_font("helvetica", "B", 8)
-            pdf.cell(col_w[0], 6, "Category", border=1, fill=True)
-            pdf.cell(col_w[1], 6, "Method", border=1, fill=True)
-            pdf.cell(col_w[2], 6, "Issue Detected", border=1, fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            pdf.set_font("helvetica", "", 8)
-            
-        if fill:
-            pdf.set_fill_color(250, 250, 250)
-        else:
-            pdf.set_fill_color(255, 255, 255)
-        
-        cat = "Fact" if f["status"] == "CONFIRMED" else "Anomaly"
-        method = f.get("layer", "Cross-document")
-        issue = clean(f["title"])
-        
-        start_y = pdf.get_y()
-        pdf.set_xy(pdf.l_margin + col_w[0] + col_w[1], start_y + 1)
-        pdf.multi_cell(col_w[2], 4, issue, border=0)
-        end_y = pdf.get_y()
-        h = max(end_y - start_y + 1, 6)
-        
-        pdf.set_xy(pdf.l_margin, start_y)
-        pdf.cell(col_w[0], h, cat, border=1, fill=fill)
-        pdf.cell(col_w[1], h, method, border=1, fill=fill)
-        pdf.rect(pdf.l_margin + col_w[0] + col_w[1], start_y, col_w[2], h, "DF" if fill else "D")
-        
-        pdf.set_xy(pdf.l_margin + col_w[0] + col_w[1], start_y + 1)
-        pdf.multi_cell(col_w[2], 4, issue, border=0)
-        
-        pdf.set_y(start_y + h)
-        fill = not fill
-        
-    pdf.ln(4)
+    pdf.set_font("helvetica", "", 8)
+    hs = FontFace(emphasis="BOLD", color=(255, 255, 255), fill_color=BRAND_DARK)
+    base = FontFace(color=TEXT_PRIMARY)
+    muted = FontFace(color=TEXT_SECONDARY)
+    with pdf.table(width=page_w, col_widths=(56, 7, 19, 18),
+                   text_align=("LEFT", "CENTER", "LEFT", "LEFT"),
+                   headings_style=hs, line_height=5, first_row_as_headings=True,
+                   borders_layout="SINGLE_TOP_LINE",
+                   cell_fill_color=(246, 248, 251), cell_fill_mode="EVEN_ROWS") as table:
+        hdr = table.row()
+        hdr.cell("What we found (plain English)")
+        hdr.cell("Page")
+        hdr.cell("How serious")
+        hdr.cell("How certain")
+        for f in all_findings:
+            h = fe.humanize(f)
+            color = SEV.get(f["severity"], (100, 116, 139))
+            row = table.row()
+            row.cell(clean(h["headline"]), style=base)
+            row.cell(str(f["page"]) if f.get("page") else "-", style=muted)
+            row.cell(clean(h["severity_label"]), style=FontFace(color=color, emphasis="BOLD"))
+            row.cell(clean(h["status_label"]), style=muted)
+    pdf.ln(3)
 
     bullet_list("What to do next", summ["actions"])
 
@@ -995,8 +998,10 @@ with st.sidebar:
 # upload + run
 # --------------------------------------------------------------------------- #
 uploaded = st.file_uploader(
-    "Upload one or more documents — PDF or Word/Excel/PowerPoint (a full deal pack works best)",
-    type=["pdf", "docx", "xlsx", "pptx", "docm", "xlsm", "pptm"],
+    "Upload one or more documents — PDF, Word/Excel/PowerPoint (incl. legacy .doc/.xls/.ppt), "
+    "or scanned images (a full deal pack works best)",
+    type=["pdf", "docx", "xlsx", "pptx", "docm", "xlsm", "pptm", "doc", "xls", "ppt",
+          "jpg", "jpeg", "png", "tif", "tiff", "bmp", "gif", "webp"],
     accept_multiple_files=True)
 
 if not uploaded:

@@ -14,3 +14,5 @@ sample_singlefile.pdf
 .DS_Store
 sample_google.pdf
 sample_da.pdf
+secrets.toml
+.streamlit/secrets.toml

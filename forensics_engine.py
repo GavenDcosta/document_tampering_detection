@@ -1147,20 +1147,43 @@ def analyze_document(path, filename=None):
     # ---- fake redaction / drawings ----
     findings.extend(layer_drawings(doc, section_map))
 
-    # ---- multi-vintage footer/header dates ----
-    page_dates = defaultdict(set)
+    # ---- multi-vintage footer/header dates (with position, so we can say WHERE) ----
+    page_dates = defaultdict(set)          # date_lower -> set of pages
+    date_regions = defaultdict(Counter)    # date_lower -> Counter(footer/header/body)
+    date_display = {}                      # date_lower -> original-case text
     for pno, page in enumerate(doc):
+        ph = page.rect.height or 1
         for m in DATE_RE.finditer(page.get_text("text")):
-            page_dates[m.group(0).strip().lower()].add(pno + 1)
+            d = m.group(0).strip()
+            dl = d.lower()
+            page_dates[dl].add(pno + 1)
+            date_display.setdefault(dl, d)
+            try:
+                rects = page.search_for(d)
+                if rects:
+                    ry = rects[0].y0 / ph
+                    region = "footer" if ry > 0.82 else ("header" if ry < 0.14 else "body")
+                    date_regions[dl][region] += 1
+            except Exception:
+                pass
     repeated = {d: ps for d, ps in page_dates.items() if len(ps) >= 3}
     if len(repeated) >= 2:
-        listing = "; ".join(f"'{d}' on {len(ps)} pages" for d, ps in
-                            sorted(repeated.items(), key=lambda x: -len(x[1]))[:5])
+        allreg = Counter()
+        for dl in repeated:
+            allreg.update(date_regions[dl])
+        where = allreg.most_common(1)[0][0] if allreg else "footer/header"
+        parts = []
+        for dl, ps in sorted(repeated.items(), key=lambda x: -len(x[1]))[:5]:
+            reg = date_regions[dl].most_common(1)[0][0] if date_regions[dl] else where
+            parts.append(f"'{date_display[dl]}' in the {reg} of {len(ps)} pages")
+        listing = "; ".join(parts)
         findings.append(_finding(
             "Text", "Medium", "CONFIRMED", "Multiple template vintages",
-            f"Several distinct dates each recur across many pages (footer/header lines): "
-            f"{listing}. A single document carrying multiple template dates suggests parts "
-            f"were assembled from different template versions.",
+            f"The page {where}s carry several different fixed dates - these are running "
+            f"{where} dates (version/template stamps), NOT dates written in the body text: "
+            f"{listing}. When one document's {where}s show several different version-dates, it "
+            f"usually means the document was assembled from templates of different vintages "
+            f"(for example a main body plus exhibits taken from different source documents).",
             evidence=listing))
 
     # ---- full-page raster inside a text PDF (+ ELA on the scan) ----
@@ -1437,11 +1460,189 @@ def _office_images(path):
     return out
 
 
+def _office_meta_findings(creator, last_by, company, template, revision, created, modified,
+                          filename):
+    """Shared Office metadata checks — used by both modern (.docx) and legacy (.doc)
+    files: author-vs-last-editor, modified-before-created, foreign template/company,
+    and heavy revision counts."""
+    findings = []
+    if creator and last_by and creator.strip().lower() != last_by.strip().lower():
+        findings.append(_finding(
+            "Metadata", "Medium", "REVIEW", "Last editor differs from the author",
+            f"The document was created by '{creator}' but last saved by '{last_by}'. More than "
+            f"one person handled the file — normal for collaboration, relevant if the parties "
+            f"are meant to be independent.",
+            evidence=f"creator={creator}; lastModifiedBy={last_by}"))
+
+    if created and modified and modified < created:
+        findings.append(_finding(
+            "Metadata", "Medium", "REVIEW", "Modified before created",
+            f"The file says it was last modified ({modified}) before it was created ({created}) "
+            f"— impossible for an untouched file, so a timestamp was changed.",
+            evidence=f"created={created}; modified={modified}"))
+
+    if template and template.lower() not in ("normal.dotm", "normal.dot", "normal", ""):
+        foreign = _foreign_brand_in_title(template, filename)
+        if foreign:
+            findings.append(_finding(
+                "Metadata", "High", "CONFIRMED", "Internal name reveals a different company",
+                f"The document is built on a template named '{template}', which carries the "
+                f"name '{foreign}' — a company/brand that isn't this document's own. A template "
+                f"from another party is a classic rebrand fingerprint.",
+                evidence=f"Foreign name '{foreign}' in title: {template}"))
+
+    if company and _foreign_brand_in_title(company, filename):
+        findings.append(_finding(
+            "Metadata", "Medium", "REVIEW", "Embedded company name",
+            f"The file's Company property is '{company}'. Confirm it matches the party this "
+            f"document is meant to be from.",
+            evidence=f"Company={company}"))
+
+    try:
+        if revision and int(revision) >= 20:
+            findings.append(_finding(
+                "Metadata", "Info", "REVIEW", "Many save cycles",
+                f"The document has been saved {revision} times (revision counter). Not a "
+                f"problem by itself, but useful context for how much it was worked on.",
+                evidence=f"revision={revision}"))
+    except Exception:
+        pass
+    return findings
+
+
+def analyze_legacy_office(path, filename=None):
+    """Legacy binary Office (.doc/.xls/.ppt = OLE compound files). We can't read the
+    body/tracked-changes, but the OLE SummaryInformation stream gives the forensic
+    metadata (author, last-editor, dates, revision, application, company, template)."""
+    filename = filename or os.path.basename(path)
+    import olefile
+    if not olefile.isOleFile(path):
+        raise ValueError("not a valid legacy Office (OLE) file")
+    data = open(path, "rb").read()
+    ole = olefile.OleFileIO(path)
+    m = ole.get_metadata()
+
+    def s(v):
+        if isinstance(v, bytes):
+            return v.decode("latin-1", "replace").strip()
+        return str(v).strip() if v else ""
+
+    creator, last_by = s(m.author), s(m.last_saved_by)
+    company, template = s(m.company), s(m.template)
+    application, revision = s(m.creating_application), s(m.revision_number)
+    created = m.create_time if isinstance(m.create_time, datetime.datetime) else None
+    modified = m.last_saved_time if isinstance(m.last_saved_time, datetime.datetime) else None
+    ole.close()
+
+    findings = _office_meta_findings(creator, last_by, company, template, revision,
+                                     created, modified, filename)
+    summary = {
+        "file": filename, "pages": s(m.num_pages) or "-", "producer": application or "-",
+        "creator": creator, "author": creator, "title": s(m.title) or template,
+        "created": str(created) if created else "",
+        "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
+        "analyzed_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "last_modified_by": last_by, "revision": revision,
+    }
+    return {"summary": summary, "findings": findings, "_images": [],
+            "_created_dt": created, "_producer": application, "_author": creator,
+            "_ocr_texts": {}}
+
+
+def analyze_image(path, filename=None):
+    """A standalone image upload (.jpg/.png/scan): treat it as one page and run the
+    image-forensics battery — EXIF, OCR, ELA, noise, copy-move — plus a perceptual
+    hash so a reused signature/stamp still cross-matches PDFs in the same pack."""
+    filename = filename or os.path.basename(path)
+    data = open(path, "rb").read()
+    pil = Image.open(io.BytesIO(data))
+    if pil.mode not in ("RGB", "L"):
+        pil = pil.convert("RGB")
+    w, h = pil.size
+    sha = hashlib.sha256(data).hexdigest()
+    exif = _exif_summary(pil)
+    findings, ocr_texts = [], {}
+
+    soft = (exif.get("software") or "").strip()
+    if soft and any(t in soft.lower() for t in IMAGE_EDITORS):
+        findings.append(_finding(
+            "Image", "Medium", "REVIEW", "Image-editing software tag inside an embedded image",
+            f"This image carries the editing-software tag '{soft}' in its own EXIF metadata. A "
+            f"genuinely scanned or camera-original image would not normally record an image "
+            f"editor.", page=1, evidence=f"EXIF Software={soft}", image_png=data))
+    if exif.get("gps"):
+        findings.append(_finding(
+            "Image", "Low", "REVIEW", "Location data inside an embedded image",
+            "This image carries GPS location data in its EXIF metadata.",
+            page=1, evidence="EXIF GPS present", image_png=data))
+
+    if _get_ocr() is not None:
+        toks = _ocr_image(pil)
+        text = " ".join(t for t, _c in toks).strip()
+        if text:
+            ocr_texts[sha[:16]] = text
+            snippet = re.sub(r"\s+", " ", text)[:220]
+            findings.append(_finding(
+                "Image", "Info", "REVIEW", "Text read from a scanned page (OCR)",
+                f"This upload is an image, not selectable text, so OCR was used to read it. It "
+                f"reads: \"{snippet}\". OCR can misread characters, so treat exact figures and "
+                f"names as read-with-care.", page=1, evidence=f"OCR: {snippet}", image_png=data))
+
+    try:
+        cm = _copy_move(pil)
+        if cm:
+            findings.append(_finding(
+                "Image", "Medium", "REVIEW", "Duplicated region within a scanned page (copy-move)",
+                f"Part of this image appears to be a duplicate of another area of the same image "
+                f"({cm} matching feature points move together as a block) — the fingerprint of "
+                f"copy-move editing. Images with very repetitive layout can also trigger this.",
+                page=1, evidence=f"{cm} consistent copy-move matches"))
+    except Exception:
+        pass
+    try:
+        nheat, nratio = _noise_map(pil)
+        if nratio >= 6.0:
+            findings.append(_finding(
+                "Image", "Medium", "REVIEW", "Uneven noise across a scanned page",
+                "The noise pattern across this image is uneven - one area is much noisier (or "
+                "smoother) than the rest, which can mark a region pasted in from another source.",
+                page=1, evidence=f"noise outlier ratio {nratio:.1f}", image_png=nheat))
+    except Exception:
+        pass
+    try:
+        heat, ratio, mx = _ela(pil)
+        if ratio >= 4.0 and mx >= 25:
+            findings.append(_finding(
+                "Image", "Medium", "REVIEW", "Possible edited region in a scanned page (ELA)",
+                "Error-Level Analysis of this image shows an uneven compression pattern (one "
+                "area much brighter than the rest), which can mean part of it was pasted in or "
+                "edited. The heatmap is shown for a human to judge.",
+                page=1, evidence=f"ELA hotspot ratio {ratio:.1f} (max block {mx})", image_png=heat))
+        else:
+            findings.append(_finding(
+                "Image", "Info", "REVIEW", "Error-Level Analysis heatmap (scanned page)",
+                "Error-Level Analysis was run on this image and found no strong localised "
+                "anomaly, consistent with a single untouched image. The heatmap is included so "
+                "a human can still inspect it.",
+                page=1, evidence=f"ELA hotspot ratio {ratio:.1f} (max block {mx})", image_png=heat))
+    except Exception:
+        pass
+
+    imgs = [{"page": 1, "xref": None, "w": w, "h": h, "coverage": 1.0, "rel_y": 0.0,
+             "sha16": sha[:16], "dhash": _dhash(pil), "exif": exif, "_png": data}]
+    summary = {
+        "file": filename, "pages": 1, "producer": "-", "creator": "", "author": "",
+        "title": "", "created": "", "sha256": sha, "size": len(data),
+        "analyzed_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return {"summary": summary, "findings": findings, "_images": imgs,
+            "_created_dt": None, "_producer": "", "_author": "", "_ocr_texts": ocr_texts}
+
+
 def analyze_office(path, filename=None):
     filename = filename or os.path.basename(path)
     data = open(path, "rb").read()
     props, names, blobs = _ooxml_props(path)
-    findings = []
 
     creator = props.get("creator", "")
     last_by = props.get("lastModifiedBy", "")
@@ -1454,52 +1655,8 @@ def analyze_office(path, filename=None):
     modified = _iso(props.get("modified"))
     title = props.get("title", "")
 
-    # different last editor than the author
-    if creator and last_by and creator.strip().lower() != last_by.strip().lower():
-        findings.append(_finding(
-            "Metadata", "Medium", "REVIEW", "Last editor differs from the author",
-            f"The document was created by '{creator}' but last saved by '{last_by}'. More than "
-            f"one person handled the file — normal for collaboration, relevant if the parties "
-            f"are meant to be independent.",
-            evidence=f"creator={creator}; lastModifiedBy={last_by}"))
-
-    # modified before created
-    if created and modified and modified < created:
-        findings.append(_finding(
-            "Metadata", "Medium", "REVIEW", "Modified before created",
-            f"The file says it was last modified ({modified}) before it was created ({created}) "
-            f"— impossible for an untouched file, so a timestamp was changed.",
-            evidence=f"created={created}; modified={modified}"))
-
-    # template names a foreign brand
-    if template and template.lower() not in ("normal.dotm", "normal", ""):
-        foreign = _foreign_brand_in_title(template, filename)
-        if foreign:
-            findings.append(_finding(
-                "Metadata", "High", "CONFIRMED", "Internal name reveals a different company",
-                f"The document is built on a template named '{template}', which carries the "
-                f"name '{foreign}' — a company/brand that isn't this document's own. A template "
-                f"from another party is a classic rebrand fingerprint.",
-                evidence=f"Foreign name '{foreign}' in title: {template}"))
-
-    # company field
-    if company and _foreign_brand_in_title(company, filename):
-        findings.append(_finding(
-            "Metadata", "Medium", "REVIEW", "Embedded company name",
-            f"The file's Company property is '{company}'. Confirm it matches the party this "
-            f"document is meant to be from.",
-            evidence=f"Company={company}"))
-
-    # high revision count / editing time
-    try:
-        if revision and int(revision) >= 20:
-            findings.append(_finding(
-                "Metadata", "Info", "REVIEW", "Many save cycles",
-                f"The document has been saved {revision} times (revision counter). Not a "
-                f"problem by itself, but useful context for how much it was worked on.",
-                evidence=f"revision={revision}"))
-    except Exception:
-        pass
+    findings = _office_meta_findings(creator, last_by, company, template, revision,
+                                     created, modified, filename)
 
     # tracked changes still in a Word doc
     docxml = blobs.get("word/document.xml", "")
@@ -1586,6 +1743,10 @@ def analyze_file(path, filename=None):
     try:
         if ext in (".docx", ".xlsx", ".pptx", ".docm", ".xlsm", ".pptm"):
             return analyze_office(path, filename)
+        if ext in (".doc", ".xls", ".ppt"):
+            return analyze_legacy_office(path, filename)
+        if ext in (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif", ".webp"):
+            return analyze_image(path, filename)
         return analyze_document(path, filename)
     except Exception as err:
         return _unreadable_result(path, filename, ext, err)
@@ -1889,11 +2050,13 @@ PLAIN_LANGUAGE = {
         "Recover the text under the box to see what was meant to be hidden, and treat the "
         "redaction as ineffective."),
     "Multiple template vintages": (
-        "The document carries several different template dates",
-        "Different fixed dates recur across the pages (usually in footers or headers), which "
-        "suggests the document was stitched together from templates of different vintages rather "
-        "than produced as one consistent document.",
-        "Check which sections came from which template and whether that mix is expected."),
+        "Different sections carry different footer/version dates",
+        "The small fixed dates printed in the page footers (the template/version dates, not "
+        "dates in the actual text) are not the same on all pages. Different footer dates on "
+        "different pages usually mean the document was stitched together from templates of "
+        "different vintages - e.g. the main body and the exhibits came from different sources.",
+        "Check which pages carry which footer date, and confirm that mixing those sections is "
+        "expected for this document."),
     "Page is a full-page image": (
         "A page is a scanned/flat image, not real text",
         "One page is a single picture rather than selectable text - typically a scan or a "
@@ -2045,8 +2208,8 @@ FACT_STATEMENTS = {
     "Leftover template placeholder":
         "still contains an unfilled template placeholder next to a value that should be typed in.",
     "Multiple template vintages":
-        "carries several different fixed template dates at once, so parts came from different "
-        "template versions.",
+        "carries several different version-dates in its page footers, so parts came from "
+        "different template versions.",
     "Identical image reused across files":
         "shares a byte-for-byte identical image with other documents in the set.",
     "Reused signature/stamp/graphic across files":
@@ -2227,13 +2390,16 @@ def _cli():
     args = ap.parse_args()
 
     paths = []
+    exts = (".pdf", ".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt",
+            ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")
     for inp in args.inputs:
         if os.path.isdir(inp):
-            paths += sorted(glob.glob(os.path.join(inp, "*.pdf")))
-        elif inp.lower().endswith(".pdf"):
+            for e in exts:
+                paths += sorted(glob.glob(os.path.join(inp, "*" + e)))
+        elif inp.lower().endswith(exts):
             paths.append(inp)
     if not paths:
-        print("No PDF files found.")
+        print("No analysable files found.")
         raise SystemExit(1)
 
     results = {}
